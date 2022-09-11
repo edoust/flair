@@ -4,13 +4,16 @@ from flair.models import SequenceTagger
 
 from torch import torch
 
-forward = FlairEmbeddings('de-forward')
-backward = FlairEmbeddings('de-backward')
-sequenceTagger = SequenceTagger.load('de-pos')
+# forward = FlairEmbeddings('de-forward')
+# backward = FlairEmbeddings('de-backward')
+# sequenceTagger = SequenceTagger.load('de-pos')
+
+tagger: SequenceTagger = SequenceTagger.load("flair/upos-multi-fast")
+print(tagger)
+forward = FlairEmbeddings('multi-forward-fast')
+backward = FlairEmbeddings('multi-backward-fast')
 lmforward = forward.lm
 lmbackward = backward.lm
-
-tagger: SequenceTagger = SequenceTagger.load("de-pos")
 
 # sentence0: Sentence = Sentence("Ich bin ein selbst für Deutschland außergewöhnlich nüchterner Mensch und verstehe es , meine fünf Sinne zusammenzuhalten .")
 # sentence1: Sentence = Sentence("Erzählen wir ruhig und ohne alle Aufregung .")

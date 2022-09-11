@@ -10,19 +10,20 @@ from exportmodel import ExportModel
 
 def main():
 
-    #tagger = SequenceTagger.load('de-pos')
+    # Load trained models
+    modelName = "flair/upos-multi-fast" # "de-pos"
 
-    ## Load trained models
-    forward = FlairEmbeddings('de-forward')
-    backward = FlairEmbeddings('de-backward')
-    sequenceTagger = SequenceTagger.load('de-pos')
+    sequenceTagger: SequenceTagger = SequenceTagger.load(modelName)
+    forward = sequenceTagger.embeddings.list_embedding_0;
+    backward = sequenceTagger.embeddings.list_embedding_1;
+
     lmforward = forward.lm
     lmbackward = backward.lm
 
+    embeddingSize = forward.embedding_length
 
     ## Prepare
     creator = InputCreator()
-
 
     sentence0 : Sentence = Sentence("Pla Gon")
     sentence1 : Sentence = Sentence("Xu")
@@ -37,48 +38,46 @@ def main():
     backwardIndices = torch.LongTensor([7 * 2, 3 * 2, 2 * 2 + 1, 8 * 2 + 1])
     # backwardIndices = torch.LongTensor([6 * 2, 3 * 2, 8 * 2 + 1, 4 * 2 + 1])
     striping = torch.LongTensor([0, 4, 1, 5, 2, 6, 3, 7])
-    zeros = torch.zeros([1, 2, 2048], dtype=torch.float32)
-    hidden = torch.zeros([2, 2, 256], dtype=torch.float32)
-    inputForward, inputBackward = creator.run([sentence0, sentence1], lmforward, forwardIndices, lmbackward, forwardIndices, zeros)
-    tokenShape = torch.zeros([2], dtype=torch.int64)
+    forward, backward = creator.run([sentence0, sentence1], lmforward, forwardIndices, lmbackward, forwardIndices)
 
     ## Execute
     exportModel = ExportModel(lmforward.encoder,
+                                    lmforward.proj,
                                     lmforward.rnn,
                                     lmbackward.encoder,
+                                    lmbackward.proj,
                                     lmbackward.rnn,
-                                    sequenceTagger.embedding2nn, sequenceTagger.rnn, sequenceTagger.linear)
-    prediction = exportModel.forward(inputForward, forwardIndices, inputBackward, backwardIndices, striping, characterLengths, lengths, zeros, hidden, tokenShape)
+                                    sequenceTagger.embedding2nn,
+                                    sequenceTagger.rnn,
+                                    sequenceTagger.linear)
+    exportModel.embeddingSize = embeddingSize
+    prediction = exportModel.forward(forward, forwardIndices, backward, backwardIndices, striping, characterLengths, lengths)
 
     print(prediction)
 
     #return
     ## Export
-    in_names = ["inputForward", "inputForwardIndices", "inputBackward", "inputBackwardIndices", "striping", "characterLengths", "lengths", "zeros", "hidden", "tokenShape"]
+    in_names = ["forward", "forwardIndices", "backward", "backwardIndices", "striping", "characterLengths", "lengths"]
     out_names = ["scores", "prediction"]
 
     torch.onnx.export(model=exportModel,
-                args=(inputForward, forwardIndices, inputBackward, backwardIndices, striping, characterLengths, lengths, zeros, hidden, tokenShape),
-                f=f'C:/temp/export.onnx',
+                args=(forward, forwardIndices, backward, backwardIndices, striping, characterLengths, lengths),
+                f=f'C:/temp/' + modelName + '.onnx',
                 opset_version=16,
                 input_names=in_names,
                 output_names=out_names,
                 verbose=True,
                 dynamic_axes=
                 {
-                    'inputForward': { 0:'characters', 1:'sentences' },
-                    'inputForwardIndices': { 0:'total_tokens' },
-                    'inputBackward': { 0:'characters', 1:'sentences' },
-                    'inputBackwardIndices': { 0:'total_tokens' },
+                    'forward': { 0:'characters', 1:'sentences' },
+                    'forwardIndices': { 0:'total_tokens' },
+                    'backward': { 0:'characters', 1:'sentences' },
+                    'backwardIndices': { 0:'total_tokens' },
                     'striping': { 0:'total_embeddings' },
                     'characterLengths': { 0:'sentences' },
                     'lengths': { 0:'sentences' },
-                    'zeros': { 1:'sentences' },
-                    'hidden': { 1:'sentences' },
-                    'tokenShape': { 0:'tokens' },
                     'scores': { 0:'sentences', 1:'tokens' },
                     'prediction': { 0:'sentences', 1:'tokens' }
-                    #'scores': { 0:'sentences', 1: 'tokens' }
                 })
 
 

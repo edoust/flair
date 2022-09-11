@@ -10,7 +10,7 @@ from flair.models import LanguageModel
 
 class InputCreator():
 
-    def run(self, sentences: List[Sentence], lmforward: LanguageModel, forwardIndices: torch.Tensor, lmbackward: LanguageModel, backwardIndices: torch.Tensor, hidden: torch.Tensor)-> (torch.Tensor, torch.Tensor):
+    def run(self, sentences: List[Sentence], lmforward: LanguageModel, forwardIndices: torch.Tensor, lmbackward: LanguageModel, backwardIndices: torch.Tensor)-> (torch.Tensor, torch.Tensor):
 
         self.name = 'aef'
         self.chars_per_chunk: int = 512
@@ -92,10 +92,9 @@ class InputCreator():
     def runLanguageModel(
         self,
         lm,
-        batch: torch.Tensor,
-        hidden: torch.Tensor):
+        batch: torch.Tensor):
 
-        _, rnn_output, hidden = lm.forward(batch, (hidden, hidden))
+        _, rnn_output, hidden = lm.forward(batch)
 
         return rnn_output
 
