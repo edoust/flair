@@ -60,7 +60,7 @@ def main():
     torch.onnx.export(model=exportModel,
                 args=(inputForward, forwardIndices, inputBackward, backwardIndices, striping, characterLengths, lengths, zeros, hidden, tokenShape),
                 f=f'C:/temp/export.onnx',
-                opset_version=8,
+                opset_version=16,
                 input_names=in_names,
                 output_names=out_names,
                 verbose=True,
