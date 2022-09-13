@@ -7,11 +7,15 @@ import torch
 
 import flair
 
+import re
+
 from flair.models import LanguageModel, SequenceTagger
 
-class InputCreator():
 
-    def createExportModel(self, name: str, sentences: List[Sentence]):
+class InputCreator:
+    def createExportModel(
+        self, name: str, sentences: List[Sentence], with_whitespace: bool, reverseForwardAndBackward: bool
+    ):
 
         sequenceTagger: SequenceTagger = SequenceTagger.load(name)
         forward = sequenceTagger.embeddings.list_embedding_0
@@ -21,22 +25,42 @@ class InputCreator():
         embeddingSize = forward.embedding_length
 
         # Prepare
-        forward, forwardIndices, backward, backwardIndices, lengths, striping, characterLengths = self.run(sentences,
-                                                                                                           lmforward,
-                                                                                                           lmbackward)
+        forward, forwardIndices, backward, backwardIndices, lengths, striping, characterLengths = self.run(
+            sentences, lmforward, lmbackward, with_whitespace
+        )
 
         # Execute
-        exportModel = ExportModel(lmforward.encoder, lmforward.proj, lmforward.rnn, lmbackward.encoder, lmbackward.proj,
-                                  lmbackward.rnn, sequenceTagger.embedding2nn, sequenceTagger.rnn,
-                                  sequenceTagger.linear)
+        exportModel = ExportModel(
+            lmforward.encoder,
+            lmforward.proj,
+            lmforward.rnn,
+            lmbackward.encoder,
+            lmbackward.proj,
+            lmbackward.rnn,
+            sequenceTagger.embedding2nn,
+            sequenceTagger.rnn,
+            sequenceTagger.linear,
+        )
         exportModel.embeddingSize = embeddingSize
+        exportModel.reverseForwardAndBackward = reverseForwardAndBackward
 
-        return exportModel, forward, forwardIndices, backward, backwardIndices, striping, characterLengths, lengths
+        return (
+            exportModel,
+            forward,
+            forwardIndices,
+            backward,
+            backwardIndices,
+            striping,
+            characterLengths,
+            lengths,
+            lmforward.dictionary,
+            lmbackward.dictionary,
+            sequenceTagger.label_dictionary.idx2item,
+        )
 
-    def run(self, sentences: List[Sentence], lmforward: LanguageModel, lmbackward: LanguageModel) -> (
-    torch.Tensor, torch.Tensor):
+    def run(self, sentences: List[Sentence], lmforward: LanguageModel, lmbackward: LanguageModel, withWhitespace: bool):
 
-        self.name = 'aef'
+        self.name = "aef"
         self.chars_per_chunk: int = 512
         self.start_marker = "\n"
         self.end_marker = " "
@@ -46,8 +70,9 @@ class InputCreator():
 
         text_sentences = [sentence.to_tokenized_string() for sentence in sentences]
         inputForward = self.getForwardLmInput(text_sentences, self.start_marker, self.end_marker, lmforward.dictionary)
-        inputBackward = self.getBackwardLmInput(text_sentences, self.start_marker, self.end_marker,
-                                                lmbackward.dictionary)
+        inputBackward = self.getBackwardLmInput(
+            text_sentences, self.start_marker, self.end_marker, lmbackward.dictionary
+        )
 
         lengths = torch.LongTensor([len(x.tokens) for x in sentences])
 
@@ -70,6 +95,9 @@ class InputCreator():
         for sentence in sentences:
 
             pos = 0
+            if withWhitespace:
+                pos += 1
+
             for token in sentence.tokens:
                 pos += len(token.text)
                 forwardIndices.append(pos * sentenceCount + sentenceIndex)
@@ -85,6 +113,9 @@ class InputCreator():
         for sentence in sentences:
 
             pos = len(sentence.text)
+            if withWhitespace:
+                pos += 1
+
             for token in sentence.tokens:
                 backwardIndices.append(pos * sentenceCount + sentenceIndex)
                 pos -= len(token.text)
@@ -97,21 +128,54 @@ class InputCreator():
             sentenceIndex += 1
 
         return (
-        inputForward, torch.LongTensor(forwardIndices), inputBackward, torch.LongTensor(backwardIndices), lengths,
-        torch.LongTensor(striping), characterLengths)
+            inputForward,
+            torch.LongTensor(forwardIndices),
+            inputBackward,
+            torch.LongTensor(backwardIndices),
+            lengths,
+            torch.LongTensor(striping),
+            characterLengths,
+        )
 
-        # This code is ~3 years old and probably doesn't work anymore
-        outputBackward = self.runLanguageModel(lmbackward, inputBackward, hidden)
-        result = self.postProcessBackwardLanguageModel("back", sentences, outputBackward, True);
-        finalOutputBackward = self.postProcessLanguageModel(outputBackward, backwardIndices)
-        outputForward = self.runLanguageModel(lmforward, inputForward, hidden)
+    def saveMappingDict(self, dict, path: str, modelName: str, dictName: str):
+        texts = []
+        line = "{char}, {value} }}"
+        for x, i in enumerate(dict):
+            texts.append(("{ " + (line.format(char=i, value=x))[1:]).replace("\\x", "0x"))
 
-        finalOutputForward = self.postProcessLanguageModel(outputForward, forwardIndices)
+        text = "{\n\t" + ",\n\t".join(texts) + "\n}"
 
-        # self._handle_output_from_lm("name", sentences, inp, True)
+        text = re.sub(r"\'0x(\w\w)0x(\w\w)\'", r"ConvertToUnicodeCharacter(0x\1, 0x\2)", text)
+        text = re.sub(r"\'0x(\w\w)0x(\w\w)0x(\w\w)\'", r"ConvertToUnicodeCharacter(0x\1, 0x\2, 0x\3)", text)
 
-    def getForwardLmInput(self, sentences: List[str], start_marker: str, end_marker: str,
-                          dict: Dictionary) -> torch.Tensor:
+        text_file = open(path + modelName + ".onnx." + dictName, "w")
+        text_file.write(text)
+        text_file.close()
+
+        # private static char ConvertToUnicodeCharacter(int a, int b)
+        # {
+        #     return Encoding.UTF8.GetChars(new[] { (byte)a, (byte)b }).Single();
+        # }
+
+        # private static char ConvertToUnicodeCharacter(int a, int b, int c)
+        # {
+        #     return Encoding.UTF8.GetChars(new[] { (byte)a, (byte)b, (byte)c }).Single();
+        # }
+
+    def saveTags(self, tags, path: str, modelName: str):
+        texts = []
+        for x, i in enumerate(tags):
+            texts.append(i.decode("utf-8"))
+
+        text = '{\n\t"' + '",\n\t"'.join(texts) + '"\n}'
+
+        text_file = open(path + modelName + ".onnx." + "tags", "w")
+        text_file.write(text)
+        text_file.close()
+
+    def getForwardLmInput(
+        self, sentences: List[str], start_marker: str, end_marker: str, dict: Dictionary
+    ) -> torch.Tensor:
 
         longest_padded_str: int = len(max(sentences, key=len)) + len(start_marker) + len(end_marker)
 
@@ -130,14 +194,13 @@ class InputCreator():
             char_indices = dict.get_idx_for_items(list(string))
             char_indices += [padding_char_index] * (longest_padded_str - len(string))
             sequences_as_char_indices.append(char_indices)
-        batch = torch.tensor(sequences_as_char_indices, dtype=torch.long).to(
-            device=flair.device, non_blocking=True
-        )
+        batch = torch.tensor(sequences_as_char_indices, dtype=torch.long).to(device=flair.device, non_blocking=True)
 
         return batch.transpose(0, 1)
 
-    def getBackwardLmInput(self, sentences: List[str], start_marker: str, end_marker: str,
-                           dict: Dictionary) -> torch.Tensor:
+    def getBackwardLmInput(
+        self, sentences: List[str], start_marker: str, end_marker: str, dict: Dictionary
+    ) -> torch.Tensor:
 
         longest_padded_str: int = len(max(sentences, key=len)) + len(start_marker) + len(end_marker)
 
@@ -157,24 +220,20 @@ class InputCreator():
             char_indices = dict.get_idx_for_items(list(string))
             char_indices += [padding_char_index] * (longest_padded_str - len(string))
             sequences_as_char_indices.append(char_indices)
-        batch = torch.tensor(sequences_as_char_indices, dtype=torch.long).to(
-            device=flair.device, non_blocking=True
-        )
+        batch = torch.tensor(sequences_as_char_indices, dtype=torch.long).to(device=flair.device, non_blocking=True)
 
         return batch.transpose(0, 1)
 
-    def runLanguageModel(
-            self,
-            lm,
-            batch: torch.Tensor):
+    def runLanguageModel(self, lm, batch: torch.Tensor):
 
         _, rnn_output, hidden = lm.forward(batch)
 
         return rnn_output
 
     # this is the flair embeddings part
-    def postProcessLanguageModel(self, all_hidden_states_in_lm: torch.Tensor, flatIndices: torch.Tensor) -> List[
-        Sentence]:
+    def postProcessLanguageModel(
+        self, all_hidden_states_in_lm: torch.Tensor, flatIndices: torch.Tensor
+    ) -> List[Sentence]:
 
         # gradients are enable if fine-tuning is enabled
         gradient_context = torch.enable_grad() if self.fine_tune else torch.no_grad()
@@ -183,14 +242,18 @@ class InputCreator():
             if not self.fine_tune:
                 all_hidden_states_in_lm = all_hidden_states_in_lm.detach()
 
-            flat = all_hidden_states_in_lm.view(torch.Size(
-                [all_hidden_states_in_lm.size(0) * all_hidden_states_in_lm.size(1), all_hidden_states_in_lm.size(2)]))
+            flat = all_hidden_states_in_lm.view(
+                torch.Size(
+                    [all_hidden_states_in_lm.size(0) * all_hidden_states_in_lm.size(1), all_hidden_states_in_lm.size(2)]
+                )
+            )
 
             return torch.index_select(flat, 0, flatIndices)
 
     # this is the flair embeddings part
-    def postProcessBackwardLanguageModel(self, name, sentences: List[Sentence], all_hidden_states_in_lm: torch.Tensor,
-                                         is_forward_lm) -> List[Sentence]:
+    def postProcessBackwardLanguageModel(
+        self, name, sentences: List[Sentence], all_hidden_states_in_lm: torch.Tensor, is_forward_lm
+    ) -> List[Sentence]:
 
         # gradients are enable if fine-tuning is enabled
         gradient_context = torch.enable_grad() if self.fine_tune else torch.no_grad()

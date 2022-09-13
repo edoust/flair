@@ -5,11 +5,24 @@ from torch import torch
 
 def main():
     # Load trained models
-    modelName = "flair/upos-multi-fast"  # "de-pos"
+    modelName = "de-pos" # "flair/upos-multi" "flair/upos-multi-fast" # "de-pos"
     sentences = [Sentence("Pla Gon"), Sentence("Xu")]
 
+    sentences = [Sentence("Ich bin ein selbst für Deutschland außergewöhnlich nüchterner Mensch und verstehe es , meine fünf Sinne zusammenzuhalten .")]
+
+    path = "c:/temp/"
+
+    # Derive from models?
+    reverseForwardAndBackward = modelName != "de-pos"
+    with_whitespace = modelName != "de-pos" # index of embedding to take varies depending on model
+
     creator = InputCreator()
-    exportModel, forward, forwardIndices, backward, backwardIndices, striping, characterLengths, lengths = creator.createExportModel(modelName, sentences)
+    exportModel, forward, forwardIndices, backward, backwardIndices, striping, characterLengths, lengths, forwardDictionary, backwardDictionary, outputTags = creator.createExportModel(modelName, sentences, with_whitespace, reverseForwardAndBackward)
+
+    creator.saveMappingDict(forwardDictionary.item2idx, path, modelName, "fw_item2idx")
+    creator.saveMappingDict(backwardDictionary.item2idx, path, modelName, "bw_item2idx")
+    creator.saveTags(outputTags, path, modelName)
+
     prediction = exportModel.forward(forward, forwardIndices, backward, backwardIndices, striping, characterLengths, lengths)
 
     print(prediction)
@@ -24,7 +37,7 @@ def main():
                       opset_version=16,
                       input_names=in_names,
                       output_names=out_names,
-                      verbose=True,
+                      verbose=False,
                       dynamic_axes=
                       {
                           'forward': {0: 'characters', 1: 'sentences'},
@@ -37,7 +50,6 @@ def main():
                           'scores': {0: 'sentences', 1: 'tokens'},
                           'prediction': {0: 'sentences', 1: 'tokens'}
                       })
-
 
 if __name__ == '__main__':
     main()

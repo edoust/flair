@@ -5,7 +5,7 @@ from torch import torch
 
 def main():
     # Load trained models
-    modelName = "flair/upos-multi-fast"  # "de-pos"
+    modelName = "flair/upos-multi"  # "de-pos"
     sentences = [Sentence("Pla Gon"), Sentence("Xu")]
 
     creator = InputCreator()

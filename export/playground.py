@@ -10,21 +10,19 @@ from torch import torch
 
 tagger: SequenceTagger = SequenceTagger.load("flair/upos-multi-fast")
 print(tagger)
-forward = FlairEmbeddings('multi-forward-fast')
-backward = FlairEmbeddings('multi-backward-fast')
-lmforward = forward.lm
-lmbackward = backward.lm
-
-# sentence0: Sentence = Sentence("Ich bin ein selbst für Deutschland außergewöhnlich nüchterner Mensch und verstehe es , meine fünf Sinne zusammenzuhalten .")
-# sentence1: Sentence = Sentence("Erzählen wir ruhig und ohne alle Aufregung .")
 
 sentence0: Sentence = Sentence("Xu")
 sentence1: Sentence = Sentence("Pla Gon")
-tagger.predict([sentence1, sentence0])
 
-print("Analysing %s" % sentence0)
-print("\nThe following NER tags are found: \n")
-print(sentence0.to_tagged_string())
+# sentence0: Sentence = Sentence("Erzählen wir ruhig und ohne alle Aufregung .")
+sentence1: Sentence = Sentence("Ich bin ein selbst für Deutschland außergewöhnlich nüchterner Mensch und verstehe es , meine fünf Sinne zusammenzuhalten .")
+# sentence2: Sentence = Sentence("We define General Aviation as any fixed wing or rotor wing aircraft fitted with 50 passenger seats or less being used for any purpose .")
+
+tagger.predict([sentence1])
+
+# print("Analysing %s" % sentence0)
+# print("\nThe following NER tags are found: \n")
+# print(sentence0.to_tagged_string())
 
 print("Analysing %s" % sentence1)
 print("\nThe following NER tags are found: \n")
