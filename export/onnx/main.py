@@ -5,10 +5,10 @@ from torch import torch
 
 def main():
     # Load trained models
-    modelName = "de-pos" # "flair/upos-multi" "flair/upos-multi-fast" # "de-pos"
+    modelName = "flair/upos-multi-fast" # "flair/upos-multi" "flair/upos-multi-fast" # "de-pos"
     sentences = [Sentence("Pla Gon"), Sentence("Xu")]
 
-    sentences = [Sentence("Ich bin ein selbst für Deutschland außergewöhnlich nüchterner Mensch und verstehe es , meine fünf Sinne zusammenzuhalten .")]
+    # sentences = [Sentence("Ich bin ein selbst für Deutschland außergewöhnlich nüchterner Mensch und verstehe es , meine fünf Sinne zusammenzuhalten .")]
 
     path = "c:/temp/"
 
@@ -23,15 +23,19 @@ def main():
     creator.saveMappingDict(backwardDictionary.item2idx, path, modelName, "bw_item2idx")
     creator.saveTags(outputTags, path, modelName)
 
-    prediction = exportModel.forward(forward, forwardIndices, backward, backwardIndices, striping, characterLengths, lengths)
+    exportModel.eval()
 
-    print(prediction)
+    traced_model = torch.jit.trace(exportModel, (
+    forward, forwardIndices, backward, backwardIndices, striping, characterLengths, lengths))
+    out = traced_model(forward, forwardIndices, backward, backwardIndices, striping, characterLengths, lengths)
+
+    print(out)
 
     # Export
     in_names = ["forward", "forwardIndices", "backward", "backwardIndices", "striping", "characterLengths", "lengths"]
     out_names = ["scores", "prediction"]
 
-    torch.onnx.export(model=exportModel,
+    torch.onnx.export(model=traced_model,
                       args=(forward, forwardIndices, backward, backwardIndices, striping, characterLengths, lengths),
                       f=f'C:/temp/' + modelName + '.onnx',
                       opset_version=16,
