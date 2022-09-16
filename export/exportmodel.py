@@ -29,7 +29,7 @@ class ExportModel(nn.Module):
         self.linear: torch.nn.Linear = linear
 
     def forward(self, inputForward: torch.Tensor, inputIndicesForward: torch.Tensor, inputBackward: torch.Tensor,
-                inputIndicesBackward: torch.Tensor, striping: torch.Tensor, characterLengths: torch.Tensor, lengths: torch.Tensor):
+                inputIndicesBackward: torch.Tensor, characterLengths: torch.Tensor, lengths: torch.Tensor):
 
         zeros = torch.zeros(1, lengths.size(0), self.forwardNetwork.hidden_size, dtype=torch.float32)
 
@@ -69,14 +69,11 @@ class ExportModel(nn.Module):
         backwardEmbeddings = torch.index_select(backward_output_flat, 0, inputIndicesBackward)
 
         if self.reverseForwardAndBackward:
-            stackedEmbeddings = torch.cat((backwardEmbeddings, forwardEmbeddings), 0)
+            stackedEmbeddings = torch.cat((backwardEmbeddings, forwardEmbeddings), 1)
         else:
-            stackedEmbeddings = torch.cat((forwardEmbeddings, backwardEmbeddings), 0)
+            stackedEmbeddings = torch.cat((forwardEmbeddings, backwardEmbeddings), 1)
 
-        stripedEmbeddings = torch.index_select(stackedEmbeddings, 0, striping)
-
-        sentence_tensor = stripedEmbeddings.view(
-            torch.Size([inputForward.size(1), torch.max(lengths), 2 * self.embeddingSize]))
+        sentence_tensor = stackedEmbeddings.view(torch.Size([inputForward.size(1), torch.max(lengths), 2 * self.embeddingSize]))
 
         sentence_tensor = self.embedding2nn(sentence_tensor)
 

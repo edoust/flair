@@ -25,7 +25,7 @@ class InputCreator:
         embeddingSize = forward.embedding_length
 
         # Prepare
-        forward, forwardIndices, backward, backwardIndices, lengths, striping, characterLengths = self.run(
+        forward, forwardIndices, backward, backwardIndices, lengths, characterLengths = self.run(
             sentences, lmforward, lmbackward, with_whitespace
         )
 
@@ -50,7 +50,6 @@ class InputCreator:
             forwardIndices,
             backward,
             backwardIndices,
-            striping,
             characterLengths,
             lengths,
             lmforward.dictionary,
@@ -75,13 +74,6 @@ class InputCreator:
         )
 
         lengths = torch.LongTensor([len(x.tokens) for x in sentences])
-
-        stripingsLength = len(sentences) * max(lengths) * 2
-        striping = [int(x / 2) for x in range(0, stripingsLength)]
-        i = 1
-        for x in range(int(stripingsLength / 2), stripingsLength):
-            striping[i] = x
-            i = i + 2
 
         characterLengths = torch.LongTensor([2 + len(x.text) for x in sentences])  # forward: +2
 
@@ -133,7 +125,6 @@ class InputCreator:
             inputBackward,
             torch.LongTensor(backwardIndices),
             lengths,
-            torch.LongTensor(striping),
             characterLengths,
         )
 
