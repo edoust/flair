@@ -1,7 +1,6 @@
 import logging
 import random
 from collections import defaultdict
-from typing import Dict
 
 import torch
 from torch.utils.data.sampler import Sampler
@@ -11,33 +10,32 @@ log = logging.getLogger("flair")
 
 class FlairSampler(Sampler):
     def set_dataset(self, data_source):
-        """Initialize by passing a block_size and a plus_window parameter.
-        :param data_source: dataset to sample from
+        """Initialize the data source for the FlairSampler.
+
+        Args:
+            data_source: dataset to sample from.
         """
         self.data_source = data_source
         self.num_samples = len(self.data_source)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return self.num_samples
 
 
 class ImbalancedClassificationDatasetSampler(FlairSampler):
     """Use this to upsample rare classes and downsample common classes in your unbalanced classification dataset."""
 
-    def __init__(self):
-        super(ImbalancedClassificationDatasetSampler, self).__init__(None)
+    def __init__(self) -> None:
+        super().__init__(None)
 
     def set_dataset(self, data_source):
-        """
-        Initialize by passing a classification dataset with labels, i.e. either TextClassificationDataSet or
-        :param data_source:
-        """
+        """Initialize the dataset used for sampling."""
         self.data_source = data_source
         self.num_samples = len(self.data_source)
         self.indices = list(range(len(data_source)))
 
         # first determine the distribution of classes in the dataset
-        label_count: Dict[str, int] = defaultdict(int)
+        label_count: dict[str, int] = defaultdict(int)
         for sentence in data_source:
             for label in sentence.labels:
                 label_count[label.value] += 1
@@ -53,12 +51,13 @@ class ImbalancedClassificationDatasetSampler(FlairSampler):
 
 
 class ChunkSampler(FlairSampler):
-    """Splits data into blocks and randomizes them before sampling. This causes some order of the data to be preserved,
-    while still shuffling the data.
+    """Splits data into blocks and randomizes them before sampling.
+
+    This causes some order of the data to be preserved, while still shuffling the data.
     """
 
-    def __init__(self, block_size=5, plus_window=5):
-        super(ChunkSampler, self).__init__(None)
+    def __init__(self, block_size=5, plus_window=5) -> None:
+        super().__init__(None)
         self.block_size = block_size
         self.plus_window = plus_window
         self.data_source = None
@@ -80,15 +79,19 @@ class ChunkSampler(FlairSampler):
 
 
 class ExpandingChunkSampler(FlairSampler):
-    """Splits data into blocks and randomizes them before sampling. Block size grows with each epoch.
+    """Splits data into blocks and randomizes them before sampling.
+
+    Block size grows with each epoch.
     This causes some order of the data to be preserved, while still shuffling the data.
     """
 
-    def __init__(self, step=3):
-        """Initialize by passing a block_size and a plus_window parameter.
-        :param data_source: dataset to sample from
+    def __init__(self, step=3) -> None:
+        """Initialize the ExpandingChunkSampler.
+
+        Args:
+            step: every *step* epochs the block size increments by one.
         """
-        super(ExpandingChunkSampler, self).__init__(None)
+        super().__init__(None)
         self.block_size = 1
         self.epoch_count = 0
         self.step = step

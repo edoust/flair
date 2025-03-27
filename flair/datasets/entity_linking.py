@@ -1,50 +1,569 @@
+import abc
+import bisect
 import csv
 import logging
 import os
+import re
+from collections.abc import Iterable, Iterator
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Any, Optional, Union
 
 import requests
+from bioc import biocxml, pubtator
 
 import flair
-from flair.data import Corpus, MultiCorpus, Sentence
-from flair.datasets.sequence_labeling import ColumnCorpus
+from flair.data import Corpus, EntityCandidate, MultiCorpus, Sentence, Token
+from flair.datasets import FlairDatapointDataset
+from flair.datasets.sequence_labeling import ColumnCorpus, MultiFileColumnCorpus
 from flair.file_utils import cached_path, unpack_file
-from flair.tokenization import SegtokSentenceSplitter, SentenceSplitter
+from flair.splitter import SegtokSentenceSplitter, SentenceSplitter
 
 log = logging.getLogger("flair")
+
+
+class EntityLinkingDictionary:
+    """Base class for downloading and reading of dictionaries for entity entity linking.
+
+    A dictionary represents all entities of a knowledge base and their associated ids.
+    """
+
+    def __init__(
+        self,
+        candidates: Iterable[EntityCandidate],
+        dataset_name: Optional[str] = None,  # used as prefix to `EntityCandidate.concept_id`, e.g. NCBI Gene:2
+    ):
+        """Initialize the entity linking dictionary.
+
+        Args:
+            candidates: A iterable sequence of all Candidates contained in the knowledge base.
+            dataset_name: string to prefix concept IDs. To be used for custom dictionaries.
+        """
+        # this dataset name
+        if dataset_name is None:
+            dataset_name = self.__class__.__name__.lower()
+        self._dataset_name = dataset_name
+
+        candidates = list(candidates)
+
+        self._idx_to_candidates = {candidate.concept_id: candidate for candidate in candidates}
+
+        # one name can map to multiple concepts
+        self._text_to_index: dict[str, list[str]] = {}
+        for candidate in candidates:
+            for text in [candidate.concept_name, *candidate.synonyms]:
+                if text not in self._text_to_index:
+                    self._text_to_index[text] = []
+                self._text_to_index[text].append(candidate.concept_id)
+
+    @property
+    def database_name(self) -> str:
+        """Name of the database represented by the dictionary."""
+        return self._dataset_name
+
+    @property
+    def text_to_index(self) -> dict[str, list[str]]:
+        return self._text_to_index
+
+    @property
+    def candidates(self) -> list[EntityCandidate]:
+        return list(self._idx_to_candidates.values())
+
+    def __getitem__(self, item: str) -> EntityCandidate:
+        return self._idx_to_candidates[item]
+
+    def __contains__(self, item: str) -> bool:
+        return item in self._idx_to_candidates
+
+    def to_in_memory_dictionary(self) -> "InMemoryEntityLinkingDictionary":
+        return InMemoryEntityLinkingDictionary(list(self._idx_to_candidates.values()), self._dataset_name)
+
+
+# NOTE: EntityLinkingDictionary are lazy-loaded from a preprocessed file.
+# Use this class to load into memory all candidates
+class InMemoryEntityLinkingDictionary(EntityLinkingDictionary):
+    def __init__(self, candidates: list[EntityCandidate], dataset_name: str):
+        self._dataset_name = dataset_name
+        super().__init__(candidates, dataset_name=dataset_name)
+
+    def to_state(self) -> dict[str, Any]:
+        return {
+            "dataset_name": self._dataset_name,
+            "candidates": [candidate.to_dict() for candidate in self._idx_to_candidates.values()],
+        }
+
+    @classmethod
+    def from_state(cls, state: dict[str, Any]) -> "InMemoryEntityLinkingDictionary":
+        return cls(
+            dataset_name=state["dataset_name"],
+            candidates=[EntityCandidate(**candidate) for candidate in state["candidates"]],
+        )
+
+
+class HunerEntityLinkingDictionary(EntityLinkingDictionary):
+    """Base dictionary with data already in huner format.
+
+    Every line in the file must be formatted as follows:
+
+        concept_id||concept_name
+
+    If multiple concept ids are associated to a given name they have to be separated by a `|`, e.g.
+
+        7157||TP53|tumor protein p53
+    """
+
+    def __init__(self, path: Union[str, Path], dataset_name: str):
+        self.dataset_file = Path(path)
+        self._dataset_name = dataset_name
+        super().__init__(self._load_candidates(), dataset_name=dataset_name)
+
+    def _load_candidates(self):
+        with open(self.dataset_file) as fp:
+            for line in fp:
+                line = line.strip()
+                if line == "":
+                    continue
+                assert "||" in line, "Preprocessed EntityLinkingDictionary must have lines in the format: `cui||name`"
+                cui, name = line.split("||", 1)
+                cui, *additional_ids = cui.split("|")
+                yield EntityCandidate(
+                    concept_id=cui,
+                    concept_name=name,
+                    database_name=self._dataset_name,
+                    additional_ids=additional_ids,
+                )
+
+
+class CTD_DISEASES_DICTIONARY(EntityLinkingDictionary):
+    """Dictionary for named entity linking on diseases using the Comparative Toxicogenomics Database (CTD).
+
+    Fur further information can be found at https://ctdbase.org/
+    """
+
+    def __init__(
+        self,
+        base_path: Optional[Union[str, Path]] = None,
+    ):
+        if base_path is None:
+            base_path = flair.cache_root / "datasets"
+        base_path = Path(base_path)
+
+        dataset_name = self.__class__.__name__.lower()
+
+        data_folder = base_path / dataset_name
+
+        data_file = self.download_dictionary(data_folder)
+
+        super().__init__(self.parse_file(data_file), dataset_name="CTD-DISEASES")
+
+    def download_dictionary(self, data_dir: Path) -> Path:
+        result_file = data_dir / "CTD_diseases.tsv"
+        data_url = "https://ctdbase.org/reports/CTD_diseases.tsv.gz"
+
+        if not result_file.exists():
+            data_path = cached_path(data_url, data_dir)
+            unpack_file(data_path, unpack_to=result_file, keep=False)
+
+        return result_file
+
+    def parse_file(self, original_file: Path) -> Iterator[EntityCandidate]:
+        columns = [
+            "symbol",
+            "identifier",
+            "alternative_identifiers",
+            "definition",
+            "parent_identifiers",
+            "tree_numbers",
+            "parent_tree_numbers",
+            "synonyms",
+            "slim_mappings",
+        ]
+
+        with open(original_file, encoding="utf-8") as f:
+            reader = csv.DictReader(filter(lambda r: r[0] != "#", f), fieldnames=columns, delimiter="\t")
+
+            for row in reader:
+                identifier = row["identifier"]
+                additional_identifiers = [i for i in row.get("alternative_identifiers", "").split("|") if i != ""]
+
+                if any(i == "MESH:C" for i in [identifier, *additional_identifiers]):
+                    continue
+
+                symbol = row["symbol"]
+                synonyms = [s for s in row.get("synonyms", "").split("|") if s != ""]
+
+                yield EntityCandidate(
+                    concept_id=identifier,
+                    concept_name=symbol,
+                    database_name="CTD-DISEASES",
+                    additional_ids=additional_identifiers,
+                    synonyms=synonyms,
+                )
+
+
+class CTD_CHEMICALS_DICTIONARY(EntityLinkingDictionary):
+    """Dictionary for named entity linking on chemicals using the Comparative Toxicogenomics Database (CTD).
+
+    Fur further information can be found at https://ctdbase.org/
+    """
+
+    def __init__(
+        self,
+        base_path: Optional[Union[str, Path]] = None,
+    ):
+        if base_path is None:
+            base_path = flair.cache_root / "datasets"
+        base_path = Path(base_path)
+
+        dataset_name = self.__class__.__name__.lower()
+
+        data_folder = base_path / dataset_name
+
+        data_file = self.download_dictionary(data_folder)
+
+        super().__init__(self.parse_file(data_file), dataset_name="CTD-CHEMICALS")
+
+    def download_dictionary(self, data_dir: Path) -> Path:
+        result_file = data_dir / "CTD_chemicals.tsv"
+        data_url = "https://ctdbase.org/reports/CTD_chemicals.tsv.gz"
+
+        if not result_file.exists():
+            data_path = cached_path(data_url, data_dir)
+            unpack_file(data_path, unpack_to=result_file)
+
+        return result_file
+
+    def parse_file(self, original_file: Path) -> Iterator[EntityCandidate]:
+        columns = [
+            "symbol",
+            "identifier",
+            "casrn",
+            "definition",
+            "parent_identifiers",
+            "tree_numbers",
+            "parent_tree_numbers",
+            "synonyms",
+        ]
+
+        with open(original_file, encoding="utf-8") as f:
+            reader = csv.DictReader(filter(lambda r: r[0] != "#", f), fieldnames=columns, delimiter="\t")
+
+            for row in reader:
+                identifier = row["identifier"]
+                additional_identifiers = [i for i in row.get("alternative_identifiers", "").split("|") if i != ""]
+
+                # if identifier == "MESH:D013749":
+                #     # This MeSH ID was used by MeSH when this chemical was part of the MeSH controlled vocabulary.
+                #     continue
+
+                symbol = row["symbol"]
+                synonyms = [s for s in row.get("synonyms", "").split("|") if s != "" and s != symbol]
+
+                yield EntityCandidate(
+                    concept_id=identifier,
+                    concept_name=symbol,
+                    database_name="CTD-CHEMICALS",
+                    additional_ids=additional_identifiers,
+                    synonyms=synonyms,
+                )
+
+
+class NCBI_GENE_HUMAN_DICTIONARY(EntityLinkingDictionary):
+    """Dictionary for named entity linking on diseases using the NCBI Gene ontology.
+
+    Note that this dictionary only represents human genes - gene from different species
+    aren't included!
+
+    Fur further information can be found at https://www.ncbi.nlm.nih.gov/gene/
+    """
+
+    def __init__(
+        self,
+        base_path: Optional[Union[str, Path]] = None,
+    ):
+        if base_path is None:
+            base_path = flair.cache_root / "datasets"
+        base_path = Path(base_path)
+
+        dataset_name = self.__class__.__name__.lower()
+
+        data_folder = base_path / dataset_name
+
+        data_file = self.download_dictionary(data_folder)
+
+        super().__init__(self.parse_dictionary(data_file), dataset_name="NCBI-GENE-HUMAN")
+
+    def _is_invalid_name(self, name: Optional[str]) -> bool:
+        """Determine if a name should be skipped."""
+        if name is None:
+            return False
+        name = name.strip()
+        EMPTY_ENTRY_TEXT = [
+            "when different from all specified ones in Gene.",
+            "Record to support submission of GeneRIFs for a gene not in Gene",
+        ]
+
+        newentry = name == "NEWENTRY"
+        empty = name == ""
+        minus = name == "-"
+        text_comment = any(e in name for e in EMPTY_ENTRY_TEXT)
+
+        return any([newentry, empty, minus, text_comment])
+
+    def download_dictionary(self, data_dir: Path) -> Path:
+        result_file = data_dir / "Homo_sapiens.gene_info"
+        data_url = "https://ftp.ncbi.nih.gov/gene/DATA/GENE_INFO/Mammalia/Homo_sapiens.gene_info.gz"
+
+        if not result_file.exists():
+            data_path = cached_path(data_url, data_dir)
+            unpack_file(data_path, unpack_to=result_file)
+
+        return result_file
+
+    def parse_dictionary(self, original_file: Path) -> Iterator[EntityCandidate]:
+        synonym_fields = (
+            "Symbol_from_nomenclature_authority",
+            "Full_name_from_nomenclature_authority",
+            "description",
+            "Synonyms",
+            "Other_designations",
+        )
+        field_names = [
+            "tax_id",
+            "GeneID",
+            "Symbol",
+            "LocusTag",
+            "Synonyms",
+            "dbXrefs",
+            "chromosome",
+            "map_location",
+            "description",
+            "type_of_gene",
+            "Symbol_from_nomenclature_authority",
+            "Full_name_from_nomenclature_authority",
+            "Nomenclature_status",
+            "Other_designations",
+            "Modification_date",
+            "Feature_type",
+        ]
+
+        with open(original_file, encoding="utf-8") as f:
+            reader = csv.DictReader(filter(lambda r: r[0] != "#", f), fieldnames=field_names, delimiter="\t")
+
+            for row in reader:
+                identifier = row["GeneID"]
+                symbol = row["Symbol"]
+
+                if self._is_invalid_name(symbol):
+                    continue
+
+                synonyms = []
+                for synonym_field in synonym_fields:
+                    synonyms.extend([name.replace("'", "") for name in row.get(synonym_field, "").split("|")])
+                synonyms = sorted([sym for sym in set(synonyms) if not self._is_invalid_name(sym)])
+                if symbol in synonyms:
+                    synonyms.remove(symbol)
+
+                yield EntityCandidate(
+                    concept_id=identifier,
+                    concept_name=symbol,
+                    database_name="NCBI-GENE-HUMAN",
+                    synonyms=synonyms,
+                )
+
+
+class NCBI_TAXONOMY_DICTIONARY(EntityLinkingDictionary):
+    """Dictionary for named entity linking on organisms / species using the NCBI taxonomy ontology.
+
+    Further information about the ontology can be found at https://www.ncbi.nlm.nih.gov/taxonomy
+    """
+
+    def __init__(
+        self,
+        base_path: Optional[Union[str, Path]] = None,
+    ):
+        if base_path is None:
+            base_path = flair.cache_root / "datasets"
+        base_path = Path(base_path)
+        dataset_name = self.__class__.__name__.lower()
+
+        data_folder = base_path / dataset_name
+
+        data_file = self.download_dictionary(data_folder)
+
+        super().__init__(self.parse_dictionary(data_file), dataset_name="NCBI-TAXONOMY")
+
+    def download_dictionary(self, data_dir: Path) -> Path:
+        result_file = data_dir / "names.dmp"
+        data_url = "https://ftp.ncbi.nih.gov/pub/taxonomy/new_taxdump/new_taxdump.tar.gz"
+
+        if not result_file.exists():
+            data_path = cached_path(data_url, data_dir)
+            unpack_file(data_path, unpack_to=result_file.parent)
+
+        return result_file
+
+    def parse_dictionary(self, original_file: Path) -> Iterator[EntityCandidate]:
+        ncbi_taxonomy_synset = [
+            "genbank common name",
+            "common name",
+            "scientific name",
+            "equivalent name",
+            "synonym",
+            "acronym",
+            "blast name",
+            "genbank",
+            "genbank synonym",
+            "genbank acronym",
+            "includes",
+            "type material",
+        ]
+        main_field = "scientific name"
+        with open(original_file, encoding="utf-8") as f:
+            curr_identifier = None
+            curr_synonyms = []
+            curr_name = None
+
+            for line in f:
+                # parse line
+                parsed_line = {}
+                elements = [e.strip() for e in line.strip().split("|")]
+                parsed_line["identifier"] = elements[0]
+                parsed_line["name"] = elements[1] if elements[2] == "" else elements[2]
+                parsed_line["field"] = elements[3]
+
+                if parsed_line["name"] in ["all", "root"]:
+                    continue
+
+                if parsed_line["field"] in ["authority", "in-part", "type material"]:
+                    continue
+
+                if parsed_line["field"] not in ncbi_taxonomy_synset:
+                    raise ValueError(f"Field {parsed_line['field']} unknown!")
+
+                if curr_identifier is None:
+                    curr_identifier = parsed_line["identifier"]
+
+                if curr_identifier == parsed_line["identifier"]:
+                    synonym = parsed_line["name"]
+                    if parsed_line["field"] == main_field:
+                        curr_name = synonym
+                    else:
+                        curr_synonyms.append(synonym)
+
+                elif curr_identifier != parsed_line["identifier"]:
+                    assert curr_name is not None
+                    yield EntityCandidate(
+                        concept_id=curr_identifier,
+                        concept_name=curr_name,
+                        database_name="NCBI-TAXONOMY",
+                        synonyms=curr_synonyms,
+                    )
+
+                    curr_identifier = parsed_line["identifier"]
+                    curr_synonyms = []
+                    curr_name = None
+                    synonym = parsed_line["name"]
+                    if parsed_line["field"] == main_field:
+                        curr_name = synonym
+                    else:
+                        curr_synonyms.append(synonym)
+
+
+class ZELDA(MultiFileColumnCorpus):
+    def __init__(
+        self,
+        base_path: Optional[Union[str, Path]] = None,
+        in_memory: bool = False,
+        column_format={0: "text", 2: "nel"},
+        **corpusargs,
+    ) -> None:
+        """Initialize ZELDA Entity Linking corpus.
+
+        introduced in "ZELDA: A Comprehensive Benchmark for Supervised Entity Disambiguation" (Milich and Akbik, 2023).
+        When calling the constructor for the first time, the dataset gets automatically downloaded.
+
+        Parameters
+        ----------
+        base_path: Union[str, Path], optional
+            Default is None, meaning that corpus gets auto-downloaded and loaded. You can override this
+            to point to a different folder but typically this should not be necessary.
+        in_memory: bool
+            If True, keeps dataset in memory giving speedups in training.
+        column_format: dict[int, str]
+            The column-format to specify which columns correspond to the text or label types.
+        """
+        base_path = flair.cache_root / "datasets" if not base_path else Path(base_path)
+
+        # this dataset name
+        dataset_name = self.__class__.__name__.lower()
+
+        # default dataset folder is the cache root
+        data_folder = base_path / dataset_name
+
+        # download and parse data if necessary
+        parsed_dataset = data_folder / "train_data" / "zelda_train.conll"
+        if not parsed_dataset.exists():
+            zelda_zip_path = "https://nlp.informatik.hu-berlin.de/resources/datasets/zelda/zelda.zip"
+            aquaint_el_zip = cached_path(f"{zelda_zip_path}", base_path)
+            unpack_file(aquaint_el_zip, base_path, "zip", False)
+
+        # paths to train and test splits
+        train_file = data_folder / "train_data" / "zelda_train.conll"
+        test_path = data_folder / "test_data" / "conll"
+        test_files = [
+            test_path / "test_aida-b.conll",
+            test_path / "test_cweb.conll",
+            test_path / "test_tweeki.conll",
+            test_path / "test_reddit-comments.conll",
+            test_path / "test_reddit-posts.conll",
+            test_path / "test_shadowlinks-top.conll",
+            test_path / "test_shadowlinks-shadow.conll",
+            test_path / "test_shadowlinks-tail.conll",
+            test_path / "test_wned-wiki.conll",
+        ]
+
+        # init corpus
+        super().__init__(
+            train_files=[train_file],
+            test_files=test_files,
+            column_format=column_format,
+            in_memory=in_memory,
+            document_separator_token="-DOCSTART-",
+            comment_symbol="# ",
+            **corpusargs,
+        )
 
 
 class NEL_ENGLISH_AQUAINT(ColumnCorpus):
     def __init__(
         self,
-        base_path: Union[str, Path] = None,
+        base_path: Optional[Union[str, Path]] = None,
         in_memory: bool = True,
         agreement_threshold: float = 0.5,
         sentence_splitter: SentenceSplitter = SegtokSentenceSplitter(),
         **corpusargs,
-    ):
-        """
-        Initialize Aquaint Entity Linking corpus introduced in: D. Milne and I. H. Witten.
-        Learning to link with wikipedia
-        (https://www.cms.waikato.ac.nz/~ihw/papers/08-DNM-IHW-LearningToLinkWithWikipedia.pdf).
-        If you call the constructor the first time the dataset gets automatically downloaded and transformed in
-        tab-separated column format (aquaint.txt).
+    ) -> None:
+        """Initialize Aquaint Entity Linking corpus.
+
+        introduced in: D. Milne and I. H. Witten. Learning to link with wikipedia
+        https://www.cms.waikato.ac.nz/~ihw/papers/08-DNM-IHW-LearningToLinkWithWikipedia.pdf . If you call the constructor the first
+        time the dataset gets automatically downloaded and transformed in tab-separated column format (aquaint.txt).
 
         Parameters
         ----------
         base_path : Union[str, Path], optional
             Default is None, meaning that corpus gets auto-downloaded and loaded. You can override this
             to point to a different folder but typically this should not be necessary.
-        in_memory: If True, keeps dataset in memory giving speedups in training.
-        agreement_threshold: Some link annotations come with an agreement_score representing the agreement from the human annotators. The score ranges from lowest 0.2
-                             to highest 1.0. The lower the score, the less "important" is the entity because fewer annotators thought it was worth linking.
-                             Default is 0.5 which means the majority of annotators must have annoteted the respective entity mention.
+        in_memory: bool
+            If True, keeps dataset in memory giving speedups in training.
+        agreement_threshold: float
+            Some link annotations come with an agreement_score representing the agreement from the human annotators. The score ranges from lowest 0.2
+            to highest 1.0. The lower the score, the less "important" is the entity because fewer annotators thought it was worth linking.
+            Default is 0.5 which means the majority of annotators must have annoteted the respective entity mention.
+        sentence_splitter: `SentenceSplitter`
+            The sentencesplitter that is used to split the articles into sentences.
         """
-        if not base_path:
-            base_path = flair.cache_root / "datasets"
-        else:
-            base_path = Path(base_path)
+        base_path = flair.cache_root / "datasets" if not base_path else Path(base_path)
 
         self.agreement_threshold = agreement_threshold
 
@@ -66,14 +585,12 @@ class NEL_ENGLISH_AQUAINT(ColumnCorpus):
 
             try:
                 with open(parsed_dataset, "w", encoding="utf-8") as txt_out:
-
                     # iterate over all html files
                     for file in os.listdir(data_folder):
-
                         if not file.endswith(".htm"):
                             continue
 
-                        with open(str(data_folder / file), "r", encoding="utf-8") as txt_in:
+                        with open(str(data_folder / file), encoding="utf-8") as txt_in:
                             text = txt_in.read()
 
                         # get rid of html syntax, we only need the text
@@ -89,7 +606,6 @@ class NEL_ENGLISH_AQUAINT(ColumnCorpus):
                         txt_out.write("-DOCSTART-\n\n")
 
                         for string in strings:
-
                             # skip empty strings
                             if not string:
                                 continue
@@ -138,11 +654,10 @@ class NEL_ENGLISH_AQUAINT(ColumnCorpus):
 
                             # sentence splitting and tokenization
                             sentences = sentence_splitter.split(string)
-                            sentence_offsets = [sentence.start_pos or 0 for sentence in sentences]
+                            sentence_offsets = [sentence.start_position or 0 for sentence in sentences]
 
                             # iterate through all annotations and add to corresponding tokens
                             for mention_start, mention_length, wikiname in zip(indices, lengths, wikinames):
-
                                 # find sentence to which annotation belongs
                                 sentence_index = 0
                                 for i in range(1, len(sentences)):
@@ -158,10 +673,10 @@ class NEL_ENGLISH_AQUAINT(ColumnCorpus):
                                 # set annotation for tokens of entity mention
                                 first = True
                                 for token in sentences[sentence_index].tokens:
-                                    assert token.start_pos is not None
-                                    assert token.end_pos is not None
+                                    assert token.start_position is not None
+                                    assert token.end_position is not None
                                     if (
-                                        token.start_pos >= mention_start and token.end_pos <= mention_end
+                                        token.start_position >= mention_start and token.end_position <= mention_end
                                     ):  # token belongs to entity mention
                                         if first:
                                             token.set_label(typename="nel", value="B-" + wikiname)
@@ -171,9 +686,7 @@ class NEL_ENGLISH_AQUAINT(ColumnCorpus):
 
                             # write to out-file in column format
                             for sentence in sentences:
-
                                 for token in sentence.tokens:
-
                                     labels = token.get_labels("nel")
 
                                     if len(labels) == 0:  # no entity
@@ -189,7 +702,7 @@ class NEL_ENGLISH_AQUAINT(ColumnCorpus):
                 os.remove(parsed_dataset)
                 raise
 
-        super(NEL_ENGLISH_AQUAINT, self).__init__(
+        super().__init__(
             data_folder,
             column_format={0: "text", 1: "nel"},
             train_file=corpus_file_name,
@@ -201,32 +714,31 @@ class NEL_ENGLISH_AQUAINT(ColumnCorpus):
 class NEL_GERMAN_HIPE(ColumnCorpus):
     def __init__(
         self,
-        base_path: Union[str, Path] = None,
+        base_path: Optional[Union[str, Path]] = None,
         in_memory: bool = True,
         wiki_language: str = "dewiki",
         **corpusargs,
-    ):
-        """
-        Initialize a sentence-segmented version of the HIPE entity linking corpus for historical German (see description
-        of HIPE at https://impresso.github.io/CLEF-HIPE-2020/). This version was segmented by @stefan-it and is hosted
-        at https://github.com/stefan-it/clef-hipe.
-        If you call the constructor the first time the dataset gets automatically downloaded and transformed in
-        tab-separated column format.
+    ) -> None:
+        """Initialize a sentence-segmented version of the HIPE entity linking corpus for historical German.
+
+        see description of HIPE at https://impresso.github.io/CLEF-HIPE-2020/.
+
+        This version was segmented by @stefan-it and is hosted at https://github.com/stefan-it/clef-hipe.
+        If you call the constructor the first time the dataset gets automatically downloaded and transformed in tab-separated column format.
 
         Parameters
         ----------
         base_path : Union[str, Path], optional
             Default is None, meaning that corpus gets auto-downloaded and loaded. You can override this
             to point to a different folder but typically this should not be necessary.
-        in_memory: If True, keeps dataset in memory giving speedups in training.
-        wiki_language : specify the language of the names of the wikipedia pages, i.e. which language version of
-        Wikipedia URLs to use. Since the text is in german the default language is German.
+        in_memory: bool
+            If True, keeps dataset in memory giving speedups in training.
+        wiki_language: str
+            specify the language of the names of the wikipedia pages, i.e. which language version of
+            Wikipedia URLs to use. Since the text is in german the default language is German.
         """
         self.wiki_language = wiki_language
-        if not base_path:
-            base_path = flair.cache_root / "datasets"
-        else:
-            base_path = Path(base_path)
+        base_path = flair.cache_root / "datasets" if not base_path else Path(base_path)
 
         # this dataset name
         dataset_name = self.__class__.__name__.lower()
@@ -241,7 +753,6 @@ class NEL_GERMAN_HIPE(ColumnCorpus):
 
         # download and parse data if necessary
         if not parsed_dataset.exists():
-
             # from qwikidata.linked_data_interface import get_entity_dict_from_api
 
             original_train_path = cached_path(f"{train_raw_url}", Path("datasets") / dataset_name)
@@ -266,10 +777,10 @@ class NEL_GERMAN_HIPE(ColumnCorpus):
                     wiki_language + "_dev.tsv",
                 ],
             ):
-                with open(doc_path, "r", encoding="utf-8") as read, open(
-                    data_folder / file_name, "w", encoding="utf-8"
-                ) as write:
-
+                with (
+                    open(doc_path, encoding="utf-8") as read,
+                    open(data_folder / file_name, "w", encoding="utf-8") as write,
+                ):
                     # ignore first line
                     read.readline()
                     line = read.readline()
@@ -279,7 +790,6 @@ class NEL_GERMAN_HIPE(ColumnCorpus):
                         # commented and empty lines
                         if line[0] == "#" or line == "\n":
                             if line[2:13] == "document_id":  # beginning of new document
-
                                 if last_eos:
                                     write.write("-DOCSTART-\n\n")
                                     last_eos = False
@@ -288,20 +798,12 @@ class NEL_GERMAN_HIPE(ColumnCorpus):
 
                         else:
                             line_list = line.split("\t")
-                            if not line_list[7] in [
-                                "_",
-                                "NIL",
-                            ]:  # line has wikidata link
-
+                            if line_list[7] not in ["_", "NIL"]:  # line has wikidata link
                                 wikiname = qid_wikiname_dict[line_list[7]]
 
-                                if wikiname != "O":
-                                    annotation = line_list[1][:2] + wikiname
-                                else:  # no entry in chosen language
-                                    annotation = "O"
+                                annotation = line_list[1][:2] + wikiname if wikiname != "O" else "O"
 
                             else:
-
                                 annotation = "O"
 
                             write.write(line_list[0] + "\t" + annotation + "\n")
@@ -314,7 +816,7 @@ class NEL_GERMAN_HIPE(ColumnCorpus):
 
                         line = read.readline()
 
-        super(NEL_GERMAN_HIPE, self).__init__(
+        super().__init__(
             data_folder,
             column_format={0: "text", 1: "nel"},
             train_file=train_file_name,
@@ -325,9 +827,8 @@ class NEL_GERMAN_HIPE(ColumnCorpus):
         )
 
     def _get_qid_wikiname_dict(self, path):
-
         qid_set = set()
-        with open(path, mode="r", encoding="utf-8") as read:
+        with open(path, encoding="utf-8") as read:
             # read all Q-IDs
 
             # ignore first line
@@ -335,11 +836,9 @@ class NEL_GERMAN_HIPE(ColumnCorpus):
             line = read.readline()
 
             while line:
-
                 if not (line[0] == "#" or line == "\n"):  # commented or empty lines
                     line_list = line.split("\t")
-                    if not line_list[7] in ["_", "NIL"]:  # line has wikidata link
-
+                    if line_list[7] not in ["_", "NIL"]:  # line has wikidata link
                         qid_set.add(line_list[7])
 
                 line = read.readline()
@@ -358,13 +857,11 @@ class NEL_GERMAN_HIPE(ColumnCorpus):
             if (
                 i + 1
             ) % 50 == 0 or i == length - 1:  # there is a limit to the number of ids in one request in the wikidata api
-
                 ids += qid_list[i]
                 # request
                 response_json = requests.get(base_url + ids).json()
 
                 for qid in response_json["entities"]:
-
                     try:
                         wikiname = response_json["entities"][qid]["sitelinks"][self.wiki_language]["title"].replace(
                             " ", "_"
@@ -386,29 +883,29 @@ class NEL_GERMAN_HIPE(ColumnCorpus):
 class NEL_ENGLISH_AIDA(ColumnCorpus):
     def __init__(
         self,
-        base_path: Union[str, Path] = None,
+        base_path: Optional[Union[str, Path]] = None,
         in_memory: bool = True,
         use_ids_and_check_existence: bool = False,
         **corpusargs,
-    ):
-        """
-        Initialize AIDA CoNLL-YAGO Entity Linking corpus introduced here https://www.mpi-inf.mpg.de/departments/databases-and-information-systems/research/ambiverse-nlu/aida/downloads.
+    ) -> None:
+        """Initialize AIDA CoNLL-YAGO Entity Linking corpus.
+
+        The corpus got introduced here https://www.mpi-inf.mpg.de/departments/databases-and-information-systems/research/ambiverse-nlu/aida/downloads.
         License: https://creativecommons.org/licenses/by-sa/3.0/deed.en_US
-        If you call the constructor the first time the dataset gets automatically downloaded and transformed in tab-separated column format.
+        If you call the constructor the first time the dataset gets automatically downloaded.
 
         Parameters
         ----------
         base_path : Union[str, Path], optional
             Default is None, meaning that corpus gets auto-downloaded and loaded. You can override this
             to point to a different folder but typically this should not be necessary.
-        in_memory: If True, keeps dataset in memory giving speedups in training.
-        use_ids_and_check_existence: If True the existence of the given wikipedia ids/pagenames is checked and non existent ids/names will be ignored. This also means that one works with
+        in_memory: bool
+            If True, keeps dataset in memory giving speedups in training.
+        use_ids_and_check_existence: bool
+            If True the existence of the given wikipedia ids/pagenames is checked and non existent ids/names will be ignored. This also means that one works with
             current wikipedia-arcticle names and possibly alter some of the out-dated ones in the original dataset
         """
-        if not base_path:
-            base_path = flair.cache_root / "datasets"
-        else:
-            base_path = Path(base_path)
+        base_path = flair.cache_root / "datasets" if not base_path else Path(base_path)
 
         # this dataset name
         dataset_name = self.__class__.__name__.lower()
@@ -421,7 +918,6 @@ class NEL_ENGLISH_AIDA(ColumnCorpus):
         parsed_dataset = data_folder / corpus_file_name
 
         if not parsed_dataset.exists():
-
             testa_unprocessed_path = cached_path(f"{conll_yago_path}aida_conll_testa", Path("datasets") / dataset_name)
             testb_unprocessed_path = cached_path(f"{conll_yago_path}aida_conll_testb", Path("datasets") / dataset_name)
             train_unprocessed_path = cached_path(f"{conll_yago_path}aida_conll_train", Path("datasets") / dataset_name)
@@ -442,12 +938,8 @@ class NEL_ENGLISH_AIDA(ColumnCorpus):
                     testb_unprocessed_path,
                 ],
             ):
-                with open(data_folder / name, "w", encoding="utf-8") as write, open(
-                    path, "r", encoding="utf-8"
-                ) as read:
-
+                with open(data_folder / name, "w", encoding="utf-8") as write, open(path, encoding="utf-8") as read:
                     for line in read:
-
                         line_list = line.split("\t")
                         if len(line_list) <= 4:
                             if line_list[0][:10] == "-DOCSTART-":  # Docstart
@@ -479,7 +971,7 @@ class NEL_ENGLISH_AIDA(ColumnCorpus):
                 # delete unprocessed file
                 os.remove(path)
 
-        super(NEL_ENGLISH_AIDA, self).__init__(
+        super().__init__(
             data_folder,
             column_format={0: "text", 1: "nel"},
             train_file=corpus_file_name,
@@ -490,11 +982,10 @@ class NEL_ENGLISH_AIDA(ColumnCorpus):
         )
 
     def _get_wikiid_wikiname_dict(self, base_folder):
-
         # collect all wikiids
         wikiid_set = set()
         for data_file in ["aida_conll_testa", "aida_conll_testb", "aida_conll_train"]:
-            with open(base_folder / data_file, mode="r", encoding="utf-8") as read:
+            with open(base_folder / data_file, encoding="utf-8") as read:
                 line = read.readline()
                 while line:
                     row = line.split("\t")
@@ -512,7 +1003,6 @@ class NEL_ENGLISH_AIDA(ColumnCorpus):
             if (
                 i + 1
             ) % 50 == 0 or i == length - 1:  # there is a limit to the number of ids in one request in the wikimedia api
-
                 ids += wikiid_list[i]
                 # request
                 resp = requests.get(
@@ -543,28 +1033,31 @@ class NEL_ENGLISH_AIDA(ColumnCorpus):
 class NEL_ENGLISH_IITB(ColumnCorpus):
     def __init__(
         self,
-        base_path: Union[str, Path] = None,
+        base_path: Optional[Union[str, Path]] = None,
         in_memory: bool = True,
         ignore_disagreements: bool = False,
         sentence_splitter: SentenceSplitter = SegtokSentenceSplitter(),
         **corpusargs,
-    ):
-        """
-        Initialize ITTB Entity Linking corpus introduced in "Collective Annotation of Wikipedia Entities in Web Text" Sayali Kulkarni, Amit Singh, Ganesh Ramakrishnan, and Soumen Chakrabarti.
-        If you call the constructor the first time the dataset gets automatically downloaded and transformed in tab-separated column format.
+    ) -> None:
+        """Initialize ITTB Entity Linking corpus.
+
+        The corpus got introduced in "Collective Annotation of Wikipedia Entities in Web Text" Sayali Kulkarni, Amit Singh, Ganesh Ramakrishnan, and Soumen Chakrabarti.
+
+        If you call the constructor the first time the dataset gets automatically downloaded.
 
         Parameters
         ----------
         base_path : Union[str, Path], optional
             Default is None, meaning that corpus gets auto-downloaded and loaded. You can override this
             to point to a different folder but typically this should not be necessary.
-        in_memory: If True, keeps dataset in memory giving speedups in training.
-        ignore_disagreements: If True annotations with annotator disagreement will be ignored.
+        in_memory: bool
+            If True, keeps dataset in memory giving speedups in training.
+        ignore_disagreements: bool
+            If True annotations with annotator disagreement will be ignored.
+        sentence_splitter: `SentenceSplitter`
+            The sentencesplitter that is used to split the articles into sentences.
         """
-        if not base_path:
-            base_path = flair.cache_root / "datasets"
-        else:
-            base_path = Path(base_path)
+        base_path = flair.cache_root / "datasets" if not base_path else Path(base_path)
 
         # this dataset name
         dataset_name = self.__class__.__name__.lower() + "_" + type(sentence_splitter).__name__
@@ -577,7 +1070,6 @@ class NEL_ENGLISH_IITB(ColumnCorpus):
         parsed_dataset = data_folder / corpus_file_name
 
         if not parsed_dataset.exists():
-
             docs_zip_path = cached_path(f"{iitb_el_docs_path}", Path("datasets") / dataset_name)
             annotations_xml_path = cached_path(f"{iitb_el_annotations_path}", Path("datasets") / dataset_name)
 
@@ -598,18 +1090,16 @@ class NEL_ENGLISH_IITB(ColumnCorpus):
             with open(parsed_dataset, "w", encoding="utf-8") as write:
                 # iterate through all documents
                 for doc_name in doc_names:
-                    with open(data_folder / "crawledDocs" / doc_name, "r", encoding="utf-8") as read:
+                    with open(data_folder / "crawledDocs" / doc_name, encoding="utf-8") as read:
                         text = read.read()
 
                         # split sentences and tokenize
                         sentences = sentence_splitter.split(text)
-                        sentence_offsets = [sentence.start_pos or 0 for sentence in sentences]
+                        sentence_offsets = [sentence.start_position or 0 for sentence in sentences]
 
                         # iterate through all annotations and add to corresponding tokens
                         for elem in root:
-
                             if elem[0].text == doc_name and elem[2].text:  # annotation belongs to current document
-
                                 wikiname = elem[2].text.replace(" ", "_")
                                 assert elem[3].text is not None
                                 assert elem[4].text is not None
@@ -631,10 +1121,10 @@ class NEL_ENGLISH_IITB(ColumnCorpus):
                                 # set annotation for tokens of entity mention
                                 first = True
                                 for token in sentences[sentence_index].tokens:
-                                    assert token.start_pos is not None
-                                    assert token.end_pos is not None
+                                    assert token.start_position is not None
+                                    assert token.end_position is not None
                                     if (
-                                        token.start_pos >= mention_start and token.end_pos <= mention_end
+                                        token.start_position >= mention_start and token.end_position <= mention_end
                                     ):  # token belongs to entity mention
                                         assert elem[1].text is not None
                                         if first:
@@ -653,33 +1143,26 @@ class NEL_ENGLISH_IITB(ColumnCorpus):
                         write.write("-DOCSTART-\n\n")  # each file is one document
 
                         for sentence in sentences:
-
                             for token in sentence.tokens:
-
                                 labels = token.labels
 
                                 if len(labels) == 0:  # no entity
                                     write.write(token.text + "\tO\n")
 
-                                elif len(labels) == 1:  # annotation from one annotator
+                                elif len(labels) == 1 or labels[0].value == labels[1].value:
+                                    # annotation from one annotator or two agreeing annotators
                                     write.write(token.text + "\t" + labels[0].value + "\n")
 
-                                else:  # annotations from two annotators
+                                else:  # annotators disagree: ignore or arbitrarily take first annotation
+                                    if ignore_disagreements:
+                                        write.write(token.text + "\tO\n")
 
-                                    if labels[0].value == labels[1].value:  # annotators agree
+                                    else:
                                         write.write(token.text + "\t" + labels[0].value + "\n")
-
-                                    else:  # annotators disagree: ignore or arbitrarily take first annotation
-
-                                        if ignore_disagreements:
-                                            write.write(token.text + "\tO\n")
-
-                                        else:
-                                            write.write(token.text + "\t" + labels[0].value + "\n")
 
                             write.write("\n")  # empty line after each sentence
 
-        super(NEL_ENGLISH_IITB, self).__init__(
+        super().__init__(
             data_folder,
             column_format={0: "text", 1: "nel"},
             train_file=corpus_file_name,
@@ -691,26 +1174,28 @@ class NEL_ENGLISH_IITB(ColumnCorpus):
 class NEL_ENGLISH_TWEEKI(ColumnCorpus):
     def __init__(
         self,
-        base_path: Union[str, Path] = None,
+        base_path: Optional[Union[str, Path]] = None,
         in_memory: bool = True,
         **corpusargs,
-    ):
-        """
-        Initialize Tweeki Entity Linking corpus introduced in "Tweeki: Linking Named Entities on Twitter to a Knowledge Graph" Harandizadeh, Singh.
-        The data consits of tweets with manually annotated wikipedia links.
-        If you call the constructor the first time the dataset gets automatically downloaded and transformed in tab-separated column format.
+    ) -> None:
+        """Initialize Tweeki Entity Linking corpus.
+
+        The dataset got introduced in "Tweeki:
+        Linking Named Entities on Twitter to a Knowledge Graph" Harandizadeh,
+        Singh. The data consits of tweets with manually annotated wikipedia
+        links. If you call the constructor the first time the dataset gets
+        automatically downloaded and transformed in tab-separated column
+        format.
 
         Parameters
         ----------
         base_path : Union[str, Path], optional
             Default is None, meaning that corpus gets auto-downloaded and loaded. You can override this
             to point to a different folder but typically this should not be necessary.
-        in_memory: If True, keeps dataset in memory giving speedups in training.
+        in_memory: bool
+            If True, keeps dataset in memory giving speedups in training.
         """
-        if not base_path:
-            base_path = flair.cache_root / "datasets"
-        else:
-            base_path = Path(base_path)
+        base_path = flair.cache_root / "datasets" if not base_path else Path(base_path)
 
         # this dataset name
         dataset_name = self.__class__.__name__.lower()
@@ -723,12 +1208,12 @@ class NEL_ENGLISH_TWEEKI(ColumnCorpus):
 
         # download and parse data if necessary
         if not parsed_dataset.exists():
-
             original_file_path = cached_path(f"{tweeki_gold_el_path}", Path("datasets") / dataset_name)
 
-            with open(original_file_path, "r", encoding="utf-8") as read, open(
-                parsed_dataset, "w", encoding="utf-8"
-            ) as write:
+            with (
+                open(original_file_path, encoding="utf-8") as read,
+                open(parsed_dataset, "w", encoding="utf-8") as write,
+            ):
                 line = read.readline()
                 while line:
                     if line.startswith("#"):
@@ -747,7 +1232,7 @@ class NEL_ENGLISH_TWEEKI(ColumnCorpus):
 
             os.rename(original_file_path, str(original_file_path) + "_original")
 
-        super(NEL_ENGLISH_TWEEKI, self).__init__(
+        super().__init__(
             data_folder,
             column_format={0: "text", 1: "nel"},
             train_file=corpus_file_name,
@@ -759,22 +1244,22 @@ class NEL_ENGLISH_TWEEKI(ColumnCorpus):
 class NEL_ENGLISH_REDDIT(ColumnCorpus):
     def __init__(
         self,
-        base_path: Union[str, Path] = None,
+        base_path: Optional[Union[str, Path]] = None,
         in_memory: bool = True,
         **corpusargs,
-    ):
-        """
-        Initialize the Reddit Entity Linking corpus containing gold annotations only (https://arxiv.org/abs/2101.01228v2) in the NER-like column format.
+    ) -> None:
+        """Initialize the Reddit Entity Linking corpus containing gold annotations only.
+
+        see https://arxiv.org/abs/2101.01228v2
+
         The first time you call this constructor it will automatically download the dataset.
-        :param base_path: Default is None, meaning that corpus gets auto-downloaded and loaded. You can override this
-        to point to a different folder but typically this should not be necessary.
-        :param in_memory: If True, keeps dataset in memory giving speedups in training.
-        :param document_as_sequence: If True, all sentences of a document are read into a single Sentence object
+
+        Args:
+            base_path: Default is None, meaning that corpus gets auto-downloaded and loaded. You can override this to point to a different folder but typically this should not be necessary.
+            in_memory: If True, keeps dataset in memory giving speedups in training.
+            document_as_sequence: If True, all sentences of a document are read into a single Sentence object
         """
-        if not base_path:
-            base_path = flair.cache_root / "datasets"
-        else:
-            base_path = Path(base_path)
+        base_path = flair.cache_root / "datasets" if not base_path else Path(base_path)
 
         # this dataset name
         dataset_name = self.__class__.__name__.lower()
@@ -791,18 +1276,16 @@ class NEL_ENGLISH_REDDIT(ColumnCorpus):
             unpack_file(reddit_el_zip, data_folder, "zip", False)
 
             with open(data_folder / corpus_file_name, "w", encoding="utf-8") as txtout:
-
                 # First parse the post titles
-                with open(data_folder / "posts.tsv", "r", encoding="utf-8") as tsvin1, open(
-                    data_folder / "gold_post_annotations.tsv", "r", encoding="utf-8"
-                ) as tsvin2:
-
+                with (
+                    open(data_folder / "posts.tsv", encoding="utf-8") as tsvin1,
+                    open(data_folder / "gold_post_annotations.tsv", encoding="utf-8") as tsvin2,
+                ):
                     posts = csv.reader(tsvin1, delimiter="\t")
                     self.post_annotations = csv.reader(tsvin2, delimiter="\t")
                     self.curr_annot = next(self.post_annotations)
 
                     for row in posts:  # Go through all the post titles
-
                         txtout.writelines("-DOCSTART-\n\n")  # Start each post with a -DOCSTART- token
 
                         # Keep track of how many and which entity mentions does a given post title have
@@ -810,7 +1293,6 @@ class NEL_ENGLISH_REDDIT(ColumnCorpus):
 
                         # Check if the current post title has an entity link and parse accordingly
                         if row[0] == self.curr_annot[0]:
-
                             link_annots.append(
                                 (
                                     int(self.curr_annot[4]),
@@ -834,19 +1316,18 @@ class NEL_ENGLISH_REDDIT(ColumnCorpus):
                             )
 
                 # Then parse the comments
-                with open(data_folder / "comments.tsv", "r", encoding="utf-8") as tsvin3, open(
-                    data_folder / "gold_comment_annotations.tsv", "r", encoding="utf-8"
-                ) as tsvin4:
-
+                with (
+                    open(data_folder / "comments.tsv", encoding="utf-8") as tsvin3,
+                    open(data_folder / "gold_comment_annotations.tsv", encoding="utf-8") as tsvin4,
+                ):
                     self.comments = csv.reader(tsvin3, delimiter="\t")
                     self.comment_annotations = csv.reader(tsvin4, delimiter="\t")
                     self.curr_annot = next(self.comment_annotations)
-                    self.curr_row: Optional[List[str]] = next(self.comments)
+                    self.curr_row: Optional[list[str]] = next(self.comments)
                     self.stop_iter = False
 
                     # Iterate over the comments.tsv file, until the end is reached
                     while not self.stop_iter:
-
                         txtout.writelines("-DOCSTART-\n")  # Start each comment thread with a -DOCSTART- token
 
                         # Keep track of the current comment thread and its corresponding key, on which the annotations are matched.
@@ -859,7 +1340,7 @@ class NEL_ENGLISH_REDDIT(ColumnCorpus):
                         if comm_key in {"en5rf4c", "es3ia8j", "es3lrmw"}:
                             if comm_key == "en5rf4c":
                                 self.parsed_row = (r.split("\t") for r in self.curr_row[4].split("\n"))
-                                self.curr_comm = next(self.parsed_row)  # type: ignore
+                                self.curr_comm = next(self.parsed_row)  # type: ignore  # noqa: PGH003
                             self._fill_curr_comment(fix_flag=True)
                         # In case we are dealing with properly parsed rows, proceed with a regular parsing procedure
                         else:
@@ -907,7 +1388,7 @@ class NEL_ENGLISH_REDDIT(ColumnCorpus):
                                 txtout,
                             )
 
-        super(NEL_ENGLISH_REDDIT, self).__init__(
+        super().__init__(
             data_folder,
             column_format={0: "text", 1: "nel"},
             train_file=corpus_file_name,
@@ -916,30 +1397,37 @@ class NEL_ENGLISH_REDDIT(ColumnCorpus):
         )
 
     def _text_to_cols(self, sentence: Sentence, links: list, outfile):
+        """Convert a tokenized sentence into column format.
+
+        Args:
+            sentence: Flair Sentence object containing a tokenized post title or comment thread
+            links: array containing information about the starting and ending position of an entity mention, as well as its corresponding wiki tag
+            outfile: file, to which the output is written
         """
-        Convert a tokenized sentence into column format
-        :param sentence: Flair Sentence object containing a tokenized post title or comment thread
-        :param links: array containing information about the starting and ending position of an entity mention, as well
-        as its corresponding wiki tag
-        :param outfile: file, to which the output is written
-        """
-        for i in range(0, len(sentence)):
+        for i in range(len(sentence)):
             # If there are annotated entity mentions for given post title or a comment thread
             if links:
                 # Keep track which is the correct corresponding entity link, in cases where there is >1 link in a sentence
                 link_index = [
-                    j for j, v in enumerate(links) if (sentence[i].start_pos >= v[0] and sentence[i].end_pos <= v[1])
+                    j
+                    for j, v in enumerate(links)
+                    if (sentence[i].start_position >= v[0] and sentence[i].end_position <= v[1])
                 ]
                 # Write the token with a corresponding tag to file
                 try:
-                    if any(sentence[i].start_pos == v[0] and sentence[i].end_pos == v[1] for j, v in enumerate(links)):
+                    if any(
+                        sentence[i].start_position == v[0] and sentence[i].end_position == v[1]
+                        for j, v in enumerate(links)
+                    ):
                         outfile.writelines(sentence[i].text + "\tS-" + links[link_index[0]][2] + "\n")
                     elif any(
-                        sentence[i].start_pos == v[0] and sentence[i].end_pos != v[1] for j, v in enumerate(links)
+                        sentence[i].start_position == v[0] and sentence[i].end_position != v[1]
+                        for j, v in enumerate(links)
                     ):
                         outfile.writelines(sentence[i].text + "\tB-" + links[link_index[0]][2] + "\n")
                     elif any(
-                        sentence[i].start_pos >= v[0] and sentence[i].end_pos <= v[1] for j, v in enumerate(links)
+                        sentence[i].start_position >= v[0] and sentence[i].end_position <= v[1]
+                        for j, v in enumerate(links)
                     ):
                         outfile.writelines(sentence[i].text + "\tI-" + links[link_index[0]][2] + "\n")
                     else:
@@ -971,14 +1459,13 @@ class NEL_ENGLISH_REDDIT(ColumnCorpus):
             outfile.writelines("\n")
 
     def _fill_annot_array(self, annot_array: list, key: str, post_flag: bool) -> list:
+        """Fills the array containing information about the entity mention annotations.
+
+        Args:
+            annot_array: array to be filled
+            key: reddit id, on which the post title/comment thread is matched with its corresponding annotation
+            post_flag: flag indicating whether the annotations are collected for the post titles or comment threads
         """
-        Fills the array containing information about the entity mention annotations, used in the _text_to_cols method
-        :param annot_array: array to be filled
-        :param key: reddit id, on which the post title/comment thread is matched with its corresponding annotation
-        :param post_flag: flag indicating whether the annotations are collected for the post titles (=True)
-        or comment threads (=False)
-        """
-        next_annot = None
         while True:
             # Check if further annotations belong to the current post title or comment thread as well
             try:
@@ -994,11 +1481,10 @@ class NEL_ENGLISH_REDDIT(ColumnCorpus):
         return annot_array
 
     def _fill_curr_comment(self, fix_flag: bool):
-        """
-        Extends the string containing the current comment thread, which is passed to _text_to_cols method, when the
-        comments are parsed.
-        :param fix_flag: flag indicating whether the method is called when the incorrectly imported rows are parsed (=True)
-        or regular rows (=False)
+        """Extends the string containing the current comment thread, which is passed to _text_to_cols method, when the comments are parsed.
+
+        Args:
+            fix_flag: flag indicating whether the method is called when the incorrectly imported rows are parsed or regular rows
         """
         next_row = None
         while True:
@@ -1024,8 +1510,8 @@ def from_ufsac_to_tsv(
     encoding: str = "utf8",
     cut_multisense: bool = True,
 ):
-    """
-    Function that converts the UFSAC format into tab separated column format in a new file.
+    """Function that converts the UFSAC format into tab separated column format in a new file.
+
     Parameters
     ----------
     xml_file : Union[str, Path]
@@ -1040,12 +1526,11 @@ def from_ufsac_to_tsv(
         Boolean that determines whether or not the wn30_key tag should be cut if it contains multiple possible senses.
         If True only the first listed sense will be used. Otherwise the whole list of senses will be detected
         as one new sense. The default is True.
-
     """
 
     def make_line(word, begin_or_inside, attributes):
-        """
-        Function that creates an output line from a word.
+        """Function that creates an output line from a word.
+
         Parameters
         ----------
         word :
@@ -1060,17 +1545,14 @@ def from_ufsac_to_tsv(
             attributes[-1] = attributes[-1].split(";")[0]  # take only first sense
 
         for attrib in attributes:
-            if attrib != "O":
-                line = line + "\t" + begin_or_inside + attrib
-            else:
-                line = line + "\tO"
+            line = line + "\t" + begin_or_inside + attrib if attrib != "O" else line + "\tO"
         line += "\n"
 
         return line
 
-    def split_span(word_fields: List[str], datasetname: str):
-        """
-        Function that splits a word if necessary, i.e. if it is a multiple-word-span.
+    def split_span(word_fields: list[str], datasetname: str):
+        """Function that splits a word if necessary, i.e. if it is a multiple-word-span.
+
         Parameters
         ----------
         word_fields :
@@ -1078,7 +1560,6 @@ def from_ufsac_to_tsv(
         datasetname:
             name of corresponding dataset
         """
-
         span = word_fields[0]
 
         if datasetname in [
@@ -1088,7 +1569,7 @@ def from_ufsac_to_tsv(
             return [span]
         elif datasetname == "omsti":
             if (
-                word_fields[3] != "O" and not span == "_" and "__" not in span
+                word_fields[3] != "O" and span != "_" and "__" not in span
             ):  # has annotation and does not consist only of '_' (still not 100% clean)
                 return span.split("_")
             else:
@@ -1096,68 +1577,60 @@ def from_ufsac_to_tsv(
         else:  # for all other datasets splitting at '_' is always sensible
             return span.split("_")
 
-    txt_out = open(file=conll_file, mode="w", encoding=encoding)
-    import xml.etree.ElementTree as ET
+    with Path(conll_file).open(mode="w", encoding=encoding) as txt_out:
+        import xml.etree.ElementTree as ET
 
-    tree = ET.parse(xml_file)
-    corpus = tree.getroot()
+        tree = ET.parse(xml_file)
+        corpus = tree.getroot()
 
-    number_of_docs = len(corpus.findall("document"))
+        number_of_docs = len(corpus.findall("document"))
 
-    fields = ["surface_form", "lemma", "pos", "wn30_key"]
-    for document in corpus:
-        # Docstart
-        if number_of_docs > 1:
-            txt_out.write("-DOCSTART-\n\n")
+        fields = ["surface_form", "lemma", "pos", "wn30_key"]
+        for document in corpus:
+            # Docstart
+            if number_of_docs > 1:
+                txt_out.write("-DOCSTART-\n\n")
 
-        for paragraph in document:
+            for paragraph in document:
+                for sentence in paragraph:
+                    for word in sentence:
+                        dictionary = word.attrib
+                        fields_of_word = [word.attrib[field] if (field in dictionary) else "O" for field in fields]
 
-            for sentence in paragraph:
+                        chunks = split_span(fields_of_word, datasetname)
 
-                for word in sentence:
+                        txt_out.write(make_line(chunks[0], "B-", fields_of_word[1:]))
 
-                    dictionary = word.attrib
-                    fields_of_word = [word.attrib[field] if (field in dictionary) else "O" for field in fields]
+                        # if there is more than one word in the chunk we write each in a separate line
+                        for chunk in chunks[1:]:
+                            # print(chunks)
+                            txt_out.write(make_line(chunk, "I-", fields_of_word[1:]))
 
-                    chunks = split_span(fields_of_word, datasetname)
-
-                    txt_out.write(make_line(chunks[0], "B-", fields_of_word[1:]))
-
-                    # if there is more than one word in the chunk we write each in a separate line
-                    for chunk in chunks[1:]:
-                        # print(chunks)
-                        txt_out.write(make_line(chunk, "I-", fields_of_word[1:]))
-
-                # empty line after each sentence
-                txt_out.write("\n")
-
-    txt_out.close()
+                    # empty line after each sentence
+                    txt_out.write("\n")
 
 
-def determine_tsv_file(filename: str, data_folder: Path, cut_multisense: bool = True):
+def determine_tsv_file(filename: str, data_folder: Path, cut_multisense: bool = True) -> str:
+    """Checks if the converted .tsv file already exists and if not, creates it.
+
+    Args:
+        filename: The name of the file.
+        data_folder: The name of the folder in which the CoNLL file should reside.
+        cut_multisense: Determines whether the wn30_key tag should be cut if it contains multiple possible senses.
+            If True only the first listed sense will be used. Otherwise, the whole list of senses will be detected
+            as one new sense. The default is True.
+
+    Returns:
+        the name of the file.
     """
-    Checks if the converted .tsv file already exists and if not, creates it. Returns name of the file.
-    ----------
-    string : str
-        String that contains the name of the file.
-    data_folder : str
-        String that contains the name of the folder in which the CoNLL file should reside.
-    cut_multisense : bool, optional
-        Boolean that determines whether or not the wn30_key tag should be cut if it contains multiple possible senses.
-        If True only the first listed sense will be used. Otherwise the whole list of senses will be detected
-        as one new sense. The default is True.
-    """
-
     if cut_multisense is True and filename not in [
         "semeval2007task17",
         "trainomatic",
         "wngt",
     ]:  # these three datasets do not have multiple senses
-
         conll_file_name = filename + "_cut.tsv"
 
     else:
-
         conll_file_name = filename + ".tsv"
 
     path_to_conll_file = data_folder / conll_file_name
@@ -1178,48 +1651,38 @@ def determine_tsv_file(filename: str, data_folder: Path, cut_multisense: bool = 
 class WSD_UFSAC(MultiCorpus):
     def __init__(
         self,
-        filenames: Union[str, List[str]] = ["masc", "semcor"],
-        base_path: Union[str, Path] = None,
+        filenames: Union[str, list[str]] = ["masc", "semcor"],
+        base_path: Optional[Union[str, Path]] = None,
         in_memory: bool = True,
         cut_multisense: bool = True,
         columns={0: "text", 3: "sense"},
-        banned_sentences: List[str] = None,
+        banned_sentences: Optional[list[str]] = None,
         sample_missing_splits_in_multicorpus: Union[bool, str] = True,
         sample_missing_splits_in_each_corpus: Union[bool, str] = True,
         use_raganato_ALL_as_test_data: bool = False,
         name: str = "multicorpus",
-    ):
-        """
-        Initialize a custom corpus with any Word Sense Disambiguation (WSD) datasets in the UFSAC format from https://github.com/getalp/UFSAC.
+    ) -> None:
+        """Initialize a custom corpus with any Word Sense Disambiguation (WSD) datasets in the UFSAC format.
+
+         see https://github.com/getalp/UFSAC.
+
         If the constructor is called for the first time the data is automatically downloaded and transformed from xml to a tab separated column format.
         Since only the WordNet 3.0 version for senses is consistently available for all provided datasets we will only consider this version.
         Also we ignore the id annotation used in datasets that were originally created for evaluation tasks
-        :param filenames: Here you can pass a single datasetname or a list of ddatasetnames. The available names are:
-            'masc', 'omsti', 'raganato_ALL', 'raganato_semeval2007', 'raganato_semeval2013', 'raganato_semeval2015', 'raganato_senseval2', 'raganato_senseval3',
-            'semcor', 'semeval2007task17', 'semeval2007task7', 'semeval2013task12', 'semeval2015task13', 'senseval2', 'senseval2_lexical_sample_test',
-            'senseval2_lexical_sample_train', 'senseval3task1', 'senseval3task6_test', 'senseval3task6_train', 'trainomatic', 'wngt'.
-            So you can pass for example filenames = ['masc', 'omsti', 'wngt']. Default two mid-sized datasets 'masc' and 'semcor' are loaded.
-        :param base_path: You can override this to point to a specific folder but typically this should not be necessary.
-        :param in_memory: If True, keeps dataset in memory giving speedups in training.
-        :param document_as_sequence: If True, all sentences of a document are read into a single Sentence object
-        :param cut_multisense: Boolean that determines whether or not the wn30_key tag should be cut if it contains
-                               multiple possible senses. If True only the first listed sense will be used and the
-                               suffix '_cut' will be added to the name of the CoNLL file. Otherwise the whole list of
-                               senses will be detected as one new sense. The default is True.
-        :param columns: Columns to consider when loading the dataset. You can add 1: "lemma" or 2: "pos" to the default dict {0: "text", 3: "sense"}
-            if you want to use additional pos and/or lemma for the words.
-        :param banned_sentences: Optionally remove sentences from the corpus. Works only if `in_memory` is true
-        :param sample_missing_splits_in_multicorpus: Whether to sample missing splits when loading the multicorpus (this is redundant if
-                                                                                                                    sample_missing_splits_in_each_corpus is True)
-        :param sample_missing_splits_in_each_corpus: Whether to sample missing splits when loading each single corpus given in filenames.
-        :param use_raganato_ALL_as_test_data: If True, the raganato_ALL dataset (Raganato et al. "Word Sense Disambiguation: A unified evaluation framework and empirical compariso")
-            will be used as test data. Note that the sample_missing_splits parameters are set to 'only_dev' in this case if set to True.
-        :param name: Name of your (costum) corpus
+
+        Args:
+            filenames: Here you can pass a single datasetname or a list of datasetnames. The available names are: 'masc', 'omsti', 'raganato_ALL', 'raganato_semeval2007', 'raganato_semeval2013', 'raganato_semeval2015', 'raganato_senseval2', 'raganato_senseval3', 'semcor', 'semeval2007task17', 'semeval2007task7', 'semeval2013task12', 'semeval2015task13', 'senseval2', 'senseval2_lexical_sample_test', 'senseval2_lexical_sample_train', 'senseval3task1', 'senseval3task6_test', 'senseval3task6_train', 'trainomatic', 'wngt',
+            base_path: You can override this to point to a specific folder but typically this should not be necessary.
+            in_memory: If True, keeps dataset in memory giving speedups in training.
+            cut_multisense: Boolean that determines whether the wn30_key tag should be cut if it contains multiple possible senses. If True only the first listed sense will be used and the suffix '_cut' will be added to the name of the CoNLL file. Otherwise the whole list of senses will be detected as one new sense. The default is True.
+            columns: Columns to consider when loading the dataset. You can add 1: "lemma" or 2: "pos" to the default dict {0: "text", 3: "sense"} if you want to use additional pos and/or lemma for the words.
+            banned_sentences: Optionally remove sentences from the corpus. Works only if `in_memory` is true
+            sample_missing_splits_in_multicorpus: Whether to sample missing splits when loading the multicorpus (this is redundant if sample_missing_splits_in_each_corpus is True)
+            sample_missing_splits_in_each_corpus: Whether to sample missing splits when loading each single corpus given in filenames.
+            use_raganato_ALL_as_test_data: If True, the raganato_ALL dataset (Raganato et al. "Word Sense Disambiguation: A unified evaluation framework and empirical compariso") will be used as test data. Note that the sample_missing_splits parameters are set to 'only_dev' in this case if set to True.
+            name: Name of your corpus
         """
-        if not base_path:
-            base_path = flair.cache_root / "datasets"
-        else:
-            base_path = Path(base_path)
+        base_path = flair.cache_root / "datasets" if not base_path else Path(base_path)
 
         # this dataset name
         dataset_name = self.__class__.__name__.lower()
@@ -1255,7 +1718,7 @@ class WSD_UFSAC(MultiCorpus):
         if isinstance(filenames, str):
             filenames = [filenames]
 
-        corpora: List[Corpus] = []
+        corpora: list[Corpus] = []
 
         log.info("Transforming data into column format and creating corpora...")
 
@@ -1313,7 +1776,7 @@ class WSD_UFSAC(MultiCorpus):
             corpora.append(corpus)
         log.info("Done with transforming data into column format and creating corpora...")
 
-        super(WSD_UFSAC, self).__init__(
+        super().__init__(
             corpora,
             sample_missing_splits=sample_missing_splits_in_multicorpus,
             name=name,
@@ -1323,22 +1786,20 @@ class WSD_UFSAC(MultiCorpus):
 class WSD_RAGANATO_ALL(ColumnCorpus):
     def __init__(
         self,
-        base_path: Union[str, Path] = None,
+        base_path: Optional[Union[str, Path]] = None,
         in_memory: bool = True,
         columns={0: "text", 3: "sense"},
-        label_name_map: Dict[str, str] = None,
-        banned_sentences: List[str] = None,
+        label_name_map: Optional[dict[str, str]] = None,
+        banned_sentences: Optional[list[str]] = None,
         sample_missing_splits: bool = True,
         cut_multisense: bool = True,
-    ):
-        """
-        Initialize ragnato_ALL (concatenation of all SensEval and SemEval all-words tasks) provided in UFSAC https://github.com/getalp/UFSAC
+    ) -> None:
+        """Initialize ragnato_ALL (concatenation of all SensEval and SemEval all-words tasks) provided in UFSAC.
+
+        see https://github.com/getalp/UFSAC
         When first initializing the corpus the whole UFSAC data is downloaded.
         """
-        if not base_path:
-            base_path = flair.cache_root / "datasets"
-        else:
-            base_path = Path(base_path)
+        base_path = flair.cache_root / "datasets" if not base_path else Path(base_path)
 
         dataset_name = "wsd_ufsac"
 
@@ -1371,7 +1832,7 @@ class WSD_RAGANATO_ALL(ColumnCorpus):
             cut_multisense=cut_multisense,
         )
 
-        super(WSD_RAGANATO_ALL, self).__init__(
+        super().__init__(
             data_folder=data_folder,
             column_format=columns,
             train_file=train_file,
@@ -1388,23 +1849,21 @@ class WSD_RAGANATO_ALL(ColumnCorpus):
 class WSD_SEMCOR(ColumnCorpus):
     def __init__(
         self,
-        base_path: Union[str, Path] = None,
+        base_path: Optional[Union[str, Path]] = None,
         in_memory: bool = True,
         columns={0: "text", 3: "sense"},
-        label_name_map: Dict[str, str] = None,
-        banned_sentences: List[str] = None,
+        label_name_map: Optional[dict[str, str]] = None,
+        banned_sentences: Optional[list[str]] = None,
         sample_missing_splits: Union[bool, str] = True,
         cut_multisense: bool = True,
         use_raganato_ALL_as_test_data: bool = False,
-    ):
-        """
-        Initialize SemCor provided in UFSAC https://github.com/getalp/UFSAC
+    ) -> None:
+        """Initialize SemCor provided in UFSAC.
+
+        see https://github.com/getalp/UFSAC
         When first initializing the corpus the whole UFSAC data is downloaded.
         """
-        if not base_path:
-            base_path = flair.cache_root / "datasets"
-        else:
-            base_path = Path(base_path)
+        base_path = flair.cache_root / "datasets" if not base_path else Path(base_path)
 
         dataset_name = "wsd_ufsac"
 
@@ -1447,7 +1906,7 @@ class WSD_SEMCOR(ColumnCorpus):
 
         train_file = determine_tsv_file(filename="semcor", data_folder=data_folder, cut_multisense=cut_multisense)
 
-        super(WSD_SEMCOR, self).__init__(
+        super().__init__(
             data_folder=data_folder,
             column_format=columns,
             train_file=train_file,
@@ -1465,22 +1924,20 @@ class WSD_SEMCOR(ColumnCorpus):
 class WSD_WORDNET_GLOSS_TAGGED(ColumnCorpus):
     def __init__(
         self,
-        base_path: Union[str, Path] = None,
+        base_path: Optional[Union[str, Path]] = None,
         in_memory: bool = True,
         columns={0: "text", 3: "sense"},
-        label_name_map: Dict[str, str] = None,
-        banned_sentences: List[str] = None,
+        label_name_map: Optional[dict[str, str]] = None,
+        banned_sentences: Optional[list[str]] = None,
         sample_missing_splits: Union[bool, str] = True,
         use_raganato_ALL_as_test_data: bool = False,
-    ):
-        """
-        Initialize Princeton WordNet Gloss Corpus provided in UFSAC https://github.com/getalp/UFSAC
+    ) -> None:
+        """Initialize Princeton WordNet Gloss Corpus provided in UFSAC.
+
+        see https://github.com/getalp/UFSAC
         When first initializing the corpus the whole UFSAC data is downloaded.
         """
-        if not base_path:
-            base_path = flair.cache_root / "datasets"
-        else:
-            base_path = Path(base_path)
+        base_path = flair.cache_root / "datasets" if not base_path else Path(base_path)
 
         dataset_name = "wsd_ufsac"
 
@@ -1521,7 +1978,7 @@ class WSD_WORDNET_GLOSS_TAGGED(ColumnCorpus):
             filename="wngt", data_folder=data_folder, cut_multisense=False
         )  # does not have multisense!
 
-        super(WSD_WORDNET_GLOSS_TAGGED, self).__init__(
+        super().__init__(
             data_folder=data_folder,
             column_format=columns,
             train_file=train_file,
@@ -1539,23 +1996,21 @@ class WSD_WORDNET_GLOSS_TAGGED(ColumnCorpus):
 class WSD_MASC(ColumnCorpus):
     def __init__(
         self,
-        base_path: Union[str, Path] = None,
+        base_path: Optional[Union[str, Path]] = None,
         in_memory: bool = True,
         columns={0: "text", 3: "sense"},
-        label_name_map: Dict[str, str] = None,
-        banned_sentences: List[str] = None,
+        label_name_map: Optional[dict[str, str]] = None,
+        banned_sentences: Optional[list[str]] = None,
         sample_missing_splits: Union[bool, str] = True,
         cut_multisense: bool = True,
         use_raganato_ALL_as_test_data: bool = False,
-    ):
-        """
-        Initialize MASC (Manually Annotated Sub-Corpus) provided in UFSAC https://github.com/getalp/UFSAC
+    ) -> None:
+        """Initialize MASC (Manually Annotated Sub-Corpus) provided in UFSAC.
+
+        see https://github.com/getalp/UFSAC
         When first initializing the corpus the whole UFSAC data is downloaded.
         """
-        if not base_path:
-            base_path = flair.cache_root / "datasets"
-        else:
-            base_path = Path(base_path)
+        base_path = flair.cache_root / "datasets" if not base_path else Path(base_path)
 
         dataset_name = "wsd_ufsac"
 
@@ -1599,7 +2054,7 @@ class WSD_MASC(ColumnCorpus):
 
         train_file = determine_tsv_file(filename="masc", data_folder=data_folder, cut_multisense=cut_multisense)
 
-        super(WSD_MASC, self).__init__(
+        super().__init__(
             data_folder=data_folder,
             column_format=columns,
             train_file=train_file,
@@ -1617,23 +2072,21 @@ class WSD_MASC(ColumnCorpus):
 class WSD_OMSTI(ColumnCorpus):
     def __init__(
         self,
-        base_path: Union[str, Path] = None,
+        base_path: Optional[Union[str, Path]] = None,
         in_memory: bool = True,
         columns={0: "text", 3: "sense"},
-        label_name_map: Dict[str, str] = None,
-        banned_sentences: List[str] = None,
+        label_name_map: Optional[dict[str, str]] = None,
+        banned_sentences: Optional[list[str]] = None,
         sample_missing_splits: Union[bool, str] = True,
         cut_multisense: bool = True,
         use_raganato_ALL_as_test_data: bool = False,
-    ):
-        """
-        Initialize OMSTI (One Million Sense-Tagged Instances) provided in UFSAC https://github.com/getalp/UFSAC
+    ) -> None:
+        """Initialize OMSTI (One Million Sense-Tagged Instances) provided in UFSAC.
+
+        see https://github.com/getalp/UFSAC
         When first initializing the corpus the whole UFSAC data is downloaded.
         """
-        if not base_path:
-            base_path = flair.cache_root / "datasets"
-        else:
-            base_path = Path(base_path)
+        base_path = flair.cache_root / "datasets" if not base_path else Path(base_path)
 
         dataset_name = "wsd_ufsac"
 
@@ -1678,7 +2131,7 @@ class WSD_OMSTI(ColumnCorpus):
 
         train_file = determine_tsv_file(filename="omsti", data_folder=data_folder, cut_multisense=cut_multisense)
 
-        super(WSD_OMSTI, self).__init__(
+        super().__init__(
             data_folder=data_folder,
             column_format=columns,
             train_file=train_file,
@@ -1696,22 +2149,20 @@ class WSD_OMSTI(ColumnCorpus):
 class WSD_TRAINOMATIC(ColumnCorpus):
     def __init__(
         self,
-        base_path: Union[str, Path] = None,
+        base_path: Optional[Union[str, Path]] = None,
         in_memory: bool = True,
         columns={0: "text", 3: "sense"},
-        label_name_map: Dict[str, str] = None,
-        banned_sentences: List[str] = None,
+        label_name_map: Optional[dict[str, str]] = None,
+        banned_sentences: Optional[list[str]] = None,
         sample_missing_splits: Union[bool, str] = True,
         use_raganato_ALL_as_test_data: bool = False,
-    ):
-        """
-        Initialize Train-O-Matic provided in UFSAC https://github.com/getalp/UFSAC
+    ) -> None:
+        """Initialize Train-O-Matic provided in UFSAC.
+
+        see https://github.com/getalp/UFSAC
         When first initializing the corpus the whole UFSAC data is downloaded.
         """
-        if not base_path:
-            base_path = flair.cache_root / "datasets"
-        else:
-            base_path = Path(base_path)
+        base_path = flair.cache_root / "datasets" if not base_path else Path(base_path)
 
         dataset_name = "wsd_ufsac"
 
@@ -1754,7 +2205,7 @@ class WSD_TRAINOMATIC(ColumnCorpus):
             filename="trainomatic", data_folder=data_folder, cut_multisense=False
         )  # no multisenses
 
-        super(WSD_TRAINOMATIC, self).__init__(
+        super().__init__(
             data_folder=data_folder,
             column_format=columns,
             train_file=train_file,
@@ -1767,3 +2218,429 @@ class WSD_TRAINOMATIC(ColumnCorpus):
             banned_sentences=banned_sentences,
             sample_missing_splits=sample_missing_splits,
         )
+
+
+# TODO: Adapt this following: https://github.com/flairNLP/flair/pull/3146
+class BigBioEntityLinkingCorpus(Corpus, abc.ABC):
+    """This class implements an adapter to data sets implemented in the BigBio framework.
+
+    See: https://github.com/bigscience-workshop/biomedical
+
+    The BigBio framework harmonizes over 120 biomedical data sets and provides a uniform
+    programming api to access them. This adapter allows to use all named entity recognition
+    data sets by using the bigbio_kb schema.
+    """
+
+    def __init__(
+        self,
+        base_path: Optional[Union[str, Path]] = None,
+        label_type: str = "el",
+        norm_keys: list[str] = ["db_name", "db_id"],
+        **kwargs,
+    ) -> None:
+        self.label_type = label_type
+        self.norm_keys = norm_keys
+        base_path = flair.cache_root / "datasets" if not base_path else Path(base_path)
+
+        dataset_name = self.__class__.__name__.lower()
+
+        data_folder = base_path / dataset_name
+        paths = self._download_dataset(data_folder)
+
+        super().__init__(
+            train=self._files_to_dataset(paths["train"]) if "train" in paths else None,
+            dev=self._files_to_dataset(paths["dev"]) if "dev" in paths else None,
+            test=self._files_to_dataset(paths["test"]) if "test" in paths else None,
+            **kwargs,
+        )
+
+    @abc.abstractmethod
+    def _download_dataset(self, data_folder: Path) -> dict[str, Union[Path, list[Path]]]:
+        pass
+
+    @abc.abstractmethod
+    def _file_to_dicts(self, filepath: Path) -> Iterator[dict[str, Any]]:
+        pass
+
+    def _dict_to_sentences(self, entry: dict[str, Any]) -> list[Sentence]:
+        entities = [entity for entity in entry["entities"] if entity["normalized"]]
+
+        tokenized_passages = [
+            Sentence(passage["text"][0], start_position=passage["offsets"][0][0]) for passage in entry["passages"]
+        ]
+        start_ids = [
+            sentence.start_position + token.start_position for sentence in tokenized_passages for token in sentence
+        ]
+        end_ids = [
+            sentence.start_position + token.end_position for sentence in tokenized_passages for token in sentence
+        ]
+
+        for entity in entities:
+            for start, end in entity["offsets"]:
+                if start not in start_ids:
+                    assert start not in end_ids
+                    start_ids.append(start)
+                    end_ids.append(start)
+                if end not in end_ids:
+                    assert end not in start_ids
+                    end_ids.append(end)
+                    start_ids.append(end)
+        start_ids.sort()
+        end_ids.sort()
+        passage_sentences = []
+        n_tokens = len(start_ids)
+        for passage in entry["passages"]:
+            token_offset = passage["offsets"][0][0]
+            start_idx = bisect.bisect_left(start_ids, token_offset)
+            end_idx = bisect.bisect_right(end_ids, passage["offsets"][0][1])
+            offsets = zip(start_ids[start_idx:end_idx], end_ids[start_idx:end_idx])
+            passage_tokens = [
+                Token(passage["text"][0][start - token_offset : end - token_offset]) for start, end in offsets
+            ]
+            for i, idx in enumerate(range(start_idx, end_idx)):
+                if idx + 1 < n_tokens:
+                    passage_tokens[i].whitespace_after = start_ids[idx + 1] - end_ids[idx]
+            passage_sentences.append(Sentence(passage_tokens, start_position=token_offset))
+            for token, start, end in zip(
+                passage_sentences[-1], start_ids[start_idx:end_idx], end_ids[start_idx:end_idx]
+            ):
+                assert token.start_position + passage_sentences[-1].start_position == start
+                assert token.end_position + passage_sentences[-1].start_position == end
+
+        start_id_to_token = {
+            token.start_position + sentence.start_position: (sentence, i)
+            for sentence in passage_sentences
+            for i, token in enumerate(sentence)
+        }
+        end_id_to_token = {
+            token.end_position + sentence.start_position: (sentence, i)
+            for sentence in passage_sentences
+            for i, token in enumerate(sentence)
+        }
+        for entity in entities:
+            mention_ids = [":".join([n[key] for key in self.norm_keys]) for n in entity["normalized"]]
+            assert len(entity["offsets"]) == len(entity["text"])
+            for (start, end), text in zip(entity["offsets"], entity["text"]):
+                assert start in start_id_to_token
+                assert end in end_id_to_token
+                sent_s, start_token_idx = start_id_to_token[start]
+                sent_e, end_token_idx = end_id_to_token[end]
+                assert sent_s is sent_e
+
+                for mention_id in mention_ids:
+                    sent_s[start_token_idx : end_token_idx + 1].add_label(self.label_type, mention_id)
+        return passage_sentences
+
+    def _files_to_dataset(self, paths: Union[Path, list[Path]]) -> FlairDatapointDataset:
+        if isinstance(paths, Path):
+            paths = [paths]
+        all_sentences = []
+        for path in paths:
+            for entry in self._file_to_dicts(path):
+                all_sentences.extend(self._dict_to_sentences(entry))
+        return FlairDatapointDataset(all_sentences)
+
+
+class BIGBIO_EL_NCBI_DISEASE(BigBioEntityLinkingCorpus):
+    """This class implents the adapter for the NCBI Disease corpus.
+
+    See:
+    - Reference: https://www.sciencedirect.com/science/article/pii/S1532046413001974
+    - Link: https://www.ncbi.nlm.nih.gov/CBBresearch/Dogan/DISEASE/
+    """
+
+    def __init__(self, base_path: Optional[Union[str, Path]] = None, label_type: str = "el-diseases", **kwargs) -> None:
+        super().__init__(base_path, label_type, **kwargs)
+
+    def _download_dataset(self, data_folder: Path) -> dict[str, Union[Path, list[Path]]]:
+        download_urls = {
+            "train": (
+                "NCBItrainset_corpus.txt",
+                "https://www.ncbi.nlm.nih.gov/CBBresearch/Dogan/DISEASE/NCBItrainset_corpus.zip",
+            ),
+            "dev": (
+                "NCBIdevelopset_corpus.txt",
+                "https://www.ncbi.nlm.nih.gov/CBBresearch/Dogan/DISEASE/NCBIdevelopset_corpus.zip",
+            ),
+            "test": (
+                "NCBItestset_corpus.txt",
+                "https://www.ncbi.nlm.nih.gov/CBBresearch/Dogan/DISEASE/NCBItestset_corpus.zip",
+            ),
+        }
+        results_files: dict[str, Union[Path, list[Path]]] = {}
+
+        for split, (filename, url) in download_urls.items():
+            result_path = data_folder / filename
+            results_files[split] = result_path
+
+            if result_path.exists():
+                continue
+
+            path = cached_path(url, data_folder)
+            unpack_file(path, data_folder)
+
+        return results_files
+
+    def _file_to_dicts(self, filepath: Path) -> Iterator[dict[str, Any]]:
+        with open(filepath) as f:
+            for doc in pubtator.iterparse(f):
+                unified_example = {
+                    "id": doc.pmid,
+                    "document_id": doc.pmid,
+                    "passages": [
+                        {
+                            "text": [doc.title],
+                            "offsets": [[0, len(doc.title)]],
+                        },
+                        {
+                            "text": [doc.abstract],
+                            "offsets": [
+                                [
+                                    # +1 assumes the title and abstract will be joined by a space.
+                                    len(doc.title) + 1,
+                                    len(doc.title) + 1 + len(doc.abstract),
+                                ]
+                            ],
+                        },
+                    ],
+                }
+
+                unified_entities = []
+                for i, entity in enumerate(doc.annotations):
+                    # We need a unique identifier for this entity, so build it from the document id and entity id
+                    unified_entity_id = "_".join([doc.pmid, entity.id, str(i)])
+                    # The user can provide a callable that returns the database name.
+                    normalized = []
+
+                    for x in entity.id.split("|"):
+                        if x.startswith(("OMIM", "omim")):
+                            normalized.append({"db_name": "OMIM", "db_id": x.strip().split(":")[-1]})
+                        elif "+" in x:
+                            normalized.extend(
+                                [
+                                    {
+                                        "db_name": "MESH",
+                                        "db_id": y.split(":")[-1].strip(),
+                                    }
+                                    for y in x.split("+")
+                                ]
+                            )
+                        else:
+                            normalized.append({"db_name": "MESH", "db_id": x.split(":")[-1].strip()})
+
+                    unified_entities.append(
+                        {
+                            "id": unified_entity_id,
+                            "type": entity.type,
+                            "text": [entity.text],
+                            "offsets": [[entity.start, entity.end]],
+                            "normalized": normalized,
+                        }
+                    )
+
+                unified_example["entities"] = unified_entities
+
+                yield unified_example
+
+
+class BIGBIO_EL_BC5CDR_CHEMICAL(BigBioEntityLinkingCorpus):
+    """This class implents the adapter for the BC5CDR corpus (only chemical annotations).
+
+    See:
+    - Reference: https://academic.oup.com/database/article/doi/10.1093/database/baw068/2630414
+    - Link: https://biocreative.bioinformatics.udel.edu/tasks/biocreative-v/track-3-cdr/
+    """
+
+    def __init__(self, base_path: Optional[Union[str, Path]] = None, label_type: str = "el-chemical", **kwargs) -> None:
+        super().__init__(base_path, label_type, **kwargs)
+
+    def _download_dataset(self, data_folder: Path) -> dict[str, Union[Path, list[Path]]]:
+        url = "https://huggingface.co/datasets/bigbio/bc5cdr/resolve/main/CDR_Data.zip"
+
+        path = cached_path(url, data_folder)
+        data_path = data_folder / "CDR_Data" / "CDR.Corpus.v010516"
+        if not data_path.exists():
+            unpack_file(path, data_folder)
+            assert data_folder.exists()
+
+        results_files: dict[str, Union[Path, list[Path]]] = {
+            "train": data_path / "CDR_TrainingSet.BioC.xml",
+            "dev": data_path / "CDR_DevelopmentSet.BioC.xml",
+            "test": data_path / "CDR_TestSet.BioC.xml",
+        }
+        return results_files
+
+    def _get_bioc_entity(self, span, db_id_key="MESH"):
+        offsets = [(loc.offset, loc.offset + loc.length) for loc in span.locations]
+
+        text = span.text
+
+        if len(offsets) > 1:
+            i = 0
+            texts = []
+            for start, end in offsets:
+                chunk_len = end - start
+                texts.append(text[i : chunk_len + i])
+                i += chunk_len
+                while i < len(text) and text[i] == " ":
+                    i += 1
+        else:
+            texts = [text]
+        db_ids = span.infons[db_id_key] if db_id_key else "-1"
+
+        # some entities are not linked and
+        # some entities are linked to multiple normalized ids
+        db_ids_list = [] if db_ids == "-1" else db_ids.split("|")
+
+        normalized = [{"db_name": db_id_key, "db_id": db_id} for db_id in db_ids_list]
+
+        return {
+            "id": span.id,
+            "offsets": offsets,
+            "text": texts,
+            "type": span.infons["type"],
+            "normalized": normalized,
+        }
+
+    def _file_to_dicts(self, filepath: Path) -> Iterator[dict[str, Any]]:
+        reader = biocxml.BioCXMLDocumentReader(str(filepath))
+
+        for i, xdoc in enumerate(reader):
+            data = {
+                "document_id": xdoc.id,
+                "entities": [],
+                "passages": [],
+            }
+
+            char_start = 0
+            # passages must not overlap and spans must cover the entire document
+            for passage in xdoc.passages:
+                offsets = [[char_start, char_start + len(passage.text)]]
+                char_start = char_start + len(passage.text) + 1
+                data["passages"].append(
+                    {
+                        "type": passage.infons["type"],
+                        "text": [passage.text],
+                        "offsets": offsets,
+                    }
+                )
+
+            # entities
+            for passage in xdoc.passages:
+                for span in passage.annotations:
+                    ent = self._get_bioc_entity(span, db_id_key="MESH")
+                    if ent["type"].lower() == "chemical":
+                        data["entities"].append(ent)
+
+            yield data
+
+
+class BIGBIO_EL_GNORMPLUS(BigBioEntityLinkingCorpus):
+    """This class implents the adapter for the GNormPlus corpus.
+
+    See:
+    - Reference: https://www.hindawi.com/journals/bmri/2015/918710/
+    - Link: https://www.ncbi.nlm.nih.gov/research/bionlp/Tools/gnormplus/
+    """
+
+    def __init__(self, base_path: Optional[Union[str, Path]] = None, label_type: str = "el-genes", **kwargs) -> None:
+        self._re_tax_id = re.compile(r"(?P<db_id>\d+)\([tT]ax:(?P<tax_id>\d+)\)")
+        super().__init__(base_path, label_type, norm_keys=["db_id"], **kwargs)
+
+    def _download_dataset(self, data_folder: Path) -> dict[str, Union[Path, list[Path]]]:
+        url = "https://www.ncbi.nlm.nih.gov/CBBresearch/Lu/Demo/tmTools/download/GNormPlus/GNormPlusCorpus.zip"
+
+        path = cached_path(url, data_folder)
+        data_path = data_folder / "GNormPlusCorpus"
+        if not data_path.exists():
+            unpack_file(path, data_folder)
+            assert data_folder.exists()
+
+        results_files: dict[str, Union[Path, list[Path]]] = {
+            "train": [data_path / "BC2GNtrain.BioC.xml", data_path / "NLMIAT.BioC.xml"],
+            "test": data_path / "BC2GNtest.BioC.xml",
+        }
+        return results_files
+
+    def _parse_bioc_entity(self, span, db_id_key="NCBIGene", insert_tax_id=False):
+        offsets = [(loc.offset, loc.offset + loc.length) for loc in span.locations]
+
+        text = span.text
+
+        if len(offsets) > 1:
+            i = 0
+            texts = []
+            for start, end in offsets:
+                chunk_len = end - start
+                texts.append(text[i : chunk_len + i])
+                i += chunk_len
+                while i < len(text) and text[i] == " ":
+                    i += 1
+        else:
+            texts = [text]
+        _type = span.infons["type"]
+
+        # parse db ids
+        normalized = []
+        if _type in span.infons:
+            for _id in span.infons[_type].split(","):
+                match = self._re_tax_id.match(_id)
+                if match:
+                    _id = match.group("db_id")
+
+                n = {"db_name": db_id_key, "db_id": _id}
+                if insert_tax_id:
+                    n["tax_id"] = match.group("tax_id") if match else None
+
+                normalized.append(n)
+        return {
+            "offsets": offsets,
+            "text": texts,
+            "type": _type,
+            "normalized": normalized,
+        }
+
+    def _adjust_entity_offsets(self, text: str, entities: list[dict]):
+        for entity in entities:
+            start, end = entity["offsets"][0]
+            entity_mention = entity["text"][0]
+            if text[start:end] != entity_mention:
+                if text[start - 1 : end - 1] == entity_mention:
+                    entity["offsets"] = [(start - 1, end - 1)]
+                elif text[start : end - 1] == entity_mention:
+                    entity["offsets"] = [(start, end - 1)]
+
+    def _file_to_dicts(self, filepath: Path) -> Iterator[dict[str, Any]]:
+        with filepath.open("r") as f:
+            collection = biocxml.load(f)
+
+            for document in collection.documents:
+                text = " ".join([passage.text for passage in document.passages])
+                entities = [
+                    self._parse_bioc_entity(entity) for passage in document.passages for entity in passage.annotations
+                ]
+
+                # Some of the entities have a off-by-one error. Correct these annotations!
+                self._adjust_entity_offsets(text, entities)
+
+                # passage offsets/lengths do not connect, recalculate them for this schema.
+                passage_spans = []
+                start = 0
+                for passage in document.passages:
+                    end = start + len(passage.text)
+                    passage_spans.append((start, end))
+                    start = end + 1
+
+                features = {
+                    "passages": [
+                        {
+                            "type": passage.infons["type"],
+                            "text": [passage.text],
+                            "offsets": [span],
+                        }
+                        for passage, span in zip(document.passages, passage_spans)
+                    ],
+                    "entities": entities,
+                }
+
+                yield features

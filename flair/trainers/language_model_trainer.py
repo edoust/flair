@@ -2,10 +2,10 @@ import datetime
 import logging
 import math
 import random
-import sys
 import time
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable, Type, Union
+from typing import Any, Optional, Union
 
 import torch
 from torch import cuda
@@ -14,16 +14,10 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.optim.sgd import SGD
 from torch.utils.data import DataLoader, Dataset
 
-from flair.optim import SGDW, ReduceLRWDOnPlateau
-
-try:
-    from apex import amp
-except ImportError:
-    amp = None
-
 import flair
 from flair.data import Dictionary
 from flair.models import LanguageModel
+from flair.optim import SGDW, ReduceLRWDOnPlateau
 from flair.training_utils import add_file_handler
 
 log = logging.getLogger("flair")
@@ -40,7 +34,7 @@ class TextDataset(Dataset):
         random_case_flip: bool = True,
         document_delimiter: str = "\n",
         shuffle: bool = True,
-    ):
+    ) -> None:
         path = Path(path)
         assert path.exists()
 
@@ -58,12 +52,12 @@ class TextDataset(Dataset):
         else:
             self.files = [path]
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.files)
 
     def __getitem__(self, index=0) -> torch.Tensor:
         """Tokenizes a text file on character basis."""
-        if type(self.files[index]) is str:
+        if isinstance(self.files[index], str):
             self.files[index] = Path(self.files[index])
         assert self.files[index].exists()
 
@@ -73,7 +67,7 @@ class TextDataset(Dataset):
             )
             if self.random_case_flip:
                 text_lines = map(self.random_casechange, text_lines)
-            lines = list(map(list if self.split_on_char else str.split, text_lines))  # type: ignore # noqa: E501
+            lines = [list(line) if self.split_on_char else line.split() for line in text_lines]
 
         log.info(f"read text file with {len(lines)} lines")
 
@@ -104,7 +98,7 @@ class TextDataset(Dataset):
         return line
 
 
-class TextCorpus(object):
+class TextCorpus:
     def __init__(
         self,
         path: Union[Path, str],
@@ -113,7 +107,7 @@ class TextCorpus(object):
         character_level: bool = True,
         random_case_flip: bool = True,
         document_delimiter: str = "\n",
-    ):
+    ) -> None:
         self.dictionary: Dictionary = dictionary
         self.forward = forward
         self.split_on_char = character_level
@@ -162,15 +156,16 @@ class LanguageModelTrainer:
         self,
         model: LanguageModel,
         corpus: TextCorpus,
-        optimizer: Type[Optimizer] = SGD,
+        optimizer: type[Optimizer] = SGD,
         test_mode: bool = False,
         epoch: int = 0,
         split: int = 0,
         loss: float = 10000,
-        optimizer_state: dict = None,
-    ):
+        optimizer_state: Optional[dict[str, Any]] = None,
+        scaler_state: Optional[dict[str, Any]] = None,
+    ) -> None:
         self.model: LanguageModel = model
-        self.optimizer: Type[Optimizer] = optimizer
+        self.optimizer: type[Optimizer] = optimizer
         self.corpus: TextCorpus = corpus
         self.test_mode: bool = test_mode
 
@@ -180,6 +175,7 @@ class LanguageModelTrainer:
         self.split = split
         self.loss = loss
         self.optimizer_state = optimizer_state
+        self.scaler_state = scaler_state
 
     def train(
         self,
@@ -195,20 +191,8 @@ class LanguageModelTrainer:
         grow_to_sequence_length: int = 0,
         num_workers: int = 2,
         use_amp: bool = False,
-        amp_opt_level: str = "O1",
         **kwargs,
     ):
-
-        if use_amp:
-            if sys.version_info < (3, 0):
-                raise RuntimeError("Apex currently only supports Python 3. Aborting.")
-            if amp is None:
-                raise RuntimeError(
-                    "Failed to import apex. Please install apex from "
-                    "https://www.github.com/nvidia/apex "
-                    "to enable mixed-precision training."
-                )
-
         # cast string to Path
         base_path = Path(base_path)
 
@@ -234,18 +218,19 @@ class LanguageModelTrainer:
             best_val_loss = self.loss
             kwargs["lr"] = learning_rate
             optimizer = self.optimizer(self.model.parameters(), **kwargs)
+
+            scaler = torch.cuda.amp.GradScaler(enabled=use_amp and flair.device.type != "cpu")
+
+            if self.scaler_state:
+                scaler.load_state_dict(self.scaler_state)
+
             if self.optimizer_state is not None:
                 optimizer.load_state_dict(self.optimizer_state)
 
             if isinstance(optimizer, (AdamW, SGDW)):
-                scheduler: ReduceLROnPlateau = ReduceLRWDOnPlateau(
-                    optimizer, verbose=True, factor=anneal_factor, patience=patience
-                )
+                scheduler: ReduceLROnPlateau = ReduceLRWDOnPlateau(optimizer, factor=anneal_factor, patience=patience)
             else:
-                scheduler = ReduceLROnPlateau(optimizer, verbose=True, factor=anneal_factor, patience=patience)
-
-            if use_amp:
-                self.model, optimizer = amp.initialize(self.model, optimizer, opt_level=amp_opt_level)
+                scheduler = ReduceLROnPlateau(optimizer, factor=anneal_factor, patience=patience)
 
             training_generator = DataLoader(self.corpus.train, shuffle=False, num_workers=num_workers)
 
@@ -266,7 +251,6 @@ class LanguageModelTrainer:
                 # iterate through training data, starting at
                 # self.split (for checkpointing)
                 for curr_split, train_slice in enumerate(training_generator, self.split):
-
                     if sequence_length < grow_to_sequence_length:
                         sequence_length += 1
                     log.info(f"Sequence length is {sequence_length}")
@@ -276,7 +260,7 @@ class LanguageModelTrainer:
                     curr_split += 1
                     train_data = self._batchify(train_slice.flatten(), mini_batch_size)
 
-                    log.info("Split %d" % curr_split + "\t - ({:%H:%M:%S})".format(datetime.datetime.now()))
+                    log.info(f"Split {curr_split}\t - ({datetime.datetime.now():%H:%M:%S})")
 
                     for group in optimizer.param_groups:
                         learning_rate = group["lr"]
@@ -297,29 +281,27 @@ class LanguageModelTrainer:
                         data, targets = self._get_batch(train_data, i, sequence_length)
 
                         if not data.is_cuda and cuda.is_available():
-                            log.info("Batch %d is not on CUDA, training will be very slow" % (batch))
+                            log.info("Batch %d is not on CUDA, training will be very slow", batch)
                             raise Exception("data isnt on cuda")
 
                         self.model.zero_grad()
                         optimizer.zero_grad()
+                        with torch.autocast(device_type=flair.device.type, enabled=use_amp):
+                            # do the forward pass in the model
+                            output, rnn_output, hidden = self.model.forward(data, hidden)
 
-                        # do the forward pass in the model
-                        output, rnn_output, hidden = self.model.forward(data, hidden)
-
-                        # try to predict the targets
-                        loss = self.loss_function(output.view(-1, ntokens), targets)
+                            # try to predict the targets
+                            loss = self.loss_function(output.view(-1, ntokens), targets)
                         # Backward
-                        if use_amp:
-                            with amp.scale_loss(loss, optimizer) as scaled_loss:
-                                scaled_loss.backward()
-                        else:
-                            loss.backward()
+                        scaler.scale(loss).backward()
+
+                        scaler.unscale_(optimizer)
 
                         # `clip_grad_norm` helps prevent the exploding gradient
                         # problem in RNNs / LSTMs.
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip)
-
-                        optimizer.step()
+                        scaler.step(optimizer)
+                        scaler.update()
 
                         total_loss += loss.data
 
@@ -381,11 +363,11 @@ class LanguageModelTrainer:
                     )
 
                     with open(loss_txt, "a") as myfile:
-                        myfile.write("%s\n" % summary)
+                        myfile.write(f"{summary}\n")
 
                     log.info(summary)
                     log.info("-" * 89)
-                    log.info("%d seconds for train split %d" % (time.time() - split_start_time, curr_split))
+                    log.info("%d seconds for train split %d", time.time() - split_start_time, curr_split)
 
                 log.info("Epoch time: %.2f" % (time.time() - epoch_start_time))
 
@@ -405,7 +387,7 @@ class LanguageModelTrainer:
 
         summary = f"TEST: valid loss {test_loss:5.4f} | valid ppl {math.exp(test_loss):8.4f}"
         with open(loss_txt, "a") as myfile:
-            myfile.write("%s\n" % summary)
+            myfile.write(f"{summary}\n")
 
         log.info(summary)
         log.info("-" * 89)
@@ -459,9 +441,9 @@ class LanguageModelTrainer:
     def load_checkpoint(
         checkpoint_file: Union[str, Path],
         corpus: TextCorpus,
-        optimizer: Type[Optimizer] = SGD,
+        optimizer: type[Optimizer] = SGD,
     ):
-        if type(checkpoint_file) is str:
+        if isinstance(checkpoint_file, str):
             checkpoint_file = Path(checkpoint_file)
 
         checkpoint = LanguageModel.load_checkpoint(checkpoint_file)
@@ -473,4 +455,5 @@ class LanguageModelTrainer:
             split=checkpoint["split"],
             loss=checkpoint["loss"],
             optimizer_state=checkpoint["optimizer_state_dict"],
+            scaler_state=checkpoint.get("scaler_state_dict"),
         )

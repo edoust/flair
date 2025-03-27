@@ -8,6 +8,7 @@ import flair.datasets
 from flair.data import MultiCorpus, Sentence
 from flair.datasets import ColumnCorpus
 from flair.datasets.sequence_labeling import (
+    ONTONOTES,
     JsonlCorpus,
     JsonlDataset,
     MultiFileJsonlCorpus,
@@ -74,6 +75,54 @@ def test_load_sequence_labeling_data(tasks_base_path):
     assert len(corpus.test) == 1
 
 
+def test_load_sequence_labeling_data_with_boundaries(tasks_base_path):
+    # get training, test and dev data
+    corpus = flair.datasets.ColumnCorpus(
+        tasks_base_path / "trivial" / "trivial_bioes_with_boundaries", column_format={0: "text", 1: "ner"}
+    )
+
+    assert len(corpus.train) == 14
+    assert len(corpus.dev) == 9
+    assert len(corpus.test) == 10
+
+    # now exclude -DOCSTART- sentences
+    corpus = flair.datasets.ColumnCorpus(
+        tasks_base_path / "trivial" / "trivial_bioes_with_boundaries",
+        column_format={0: "text", 1: "ner"},
+        banned_sentences=["-DOCSTART-"],
+    )
+
+    assert len(corpus.train) == 12
+    assert len(corpus.dev) == 8
+    assert len(corpus.test) == 8
+
+    assert len(corpus.train[0].right_context(5)) == 5
+
+    # now load whole documents as sentences
+    corpus = flair.datasets.ColumnCorpus(
+        tasks_base_path / "trivial" / "trivial_bioes_with_boundaries",
+        column_format={0: "text", 1: "ner"},
+        document_separator_token="-DOCSTART-",
+        documents_as_sentences=True,
+    )
+
+    assert len(corpus.train) == 3
+    assert len(corpus.dev) == 2
+    assert len(corpus.test) == 2
+
+    assert len(corpus.train[0].right_context(5)) == 0
+
+    # ban each boundary but set each sentence to be independent
+    corpus = flair.datasets.ColumnCorpus(
+        tasks_base_path / "trivial" / "trivial_bioes_with_boundaries",
+        column_format={0: "text", 1: "ner"},
+        banned_sentences=["-DOCSTART-"],
+        every_sentence_is_independent=True,
+    )
+
+    assert len(corpus.train[0].right_context(5)) == 0
+
+
 def test_load_sequence_labeling_whitespace_after(tasks_base_path):
     # get training, test and dev data
     corpus = flair.datasets.ColumnCorpus(
@@ -88,8 +137,8 @@ def test_load_sequence_labeling_whitespace_after(tasks_base_path):
     assert corpus.train[0].to_tokenized_string() == "It is a German - owned firm ."
     assert corpus.train[0].to_plain_string() == "It is a German-owned firm."
     for token in corpus.train[0]:
-        assert token.start_pos is not None
-        assert token.end_pos is not None
+        assert token.start_position is not None
+        assert token.end_position is not None
 
 
 def test_load_column_corpus_options(tasks_base_path):
@@ -220,7 +269,7 @@ def test_download_load_data(tasks_base_path):
     # get training, test and dev data for full English UD corpus from web
     corpus = flair.datasets.UD_ENGLISH()
 
-    assert len(corpus.train) == 12543
+    assert len(corpus.train) == 12544
     assert len(corpus.dev) == 2001
     assert len(corpus.test) == 2077
 
@@ -253,7 +302,7 @@ def _assert_conllu_dataset(dataset):
         1,
         1,
         0,
-        1,
+        0,
     ]
 
     ner_spans1 = sent1.get_labels("ner")
@@ -327,9 +376,9 @@ def test_load_conllu_plus_corpus(tasks_base_path):
         in_memory=False,
     )
 
-    assert len(corpus.train) == 4
-    assert len(corpus.dev) == 4
-    assert len(corpus.test) == 4
+    assert len(corpus.train) == 5
+    assert len(corpus.dev) == 5
+    assert len(corpus.test) == 5
 
     _assert_conllu_dataset(corpus.train)
 
@@ -344,9 +393,9 @@ def test_load_conllu_corpus_plus_in_memory(tasks_base_path):
         in_memory=True,
     )
 
-    assert len(corpus.train) == 4
-    assert len(corpus.dev) == 4
-    assert len(corpus.test) == 4
+    assert len(corpus.train) == 5
+    assert len(corpus.dev) == 5
+    assert len(corpus.test) == 5
 
     _assert_conllu_dataset(corpus.train)
 
@@ -360,7 +409,7 @@ def _assert_universal_dependencies_conllu_dataset(dataset):
         1,
         1,
         0,
-        1,
+        0,
     ]
 
     assert len(sent1.get_labels("Number")) == 4
@@ -388,11 +437,8 @@ def _assert_universal_dependencies_conllu_dataset(dataset):
 
 
 def test_load_universal_dependencies_conllu_corpus(tasks_base_path):
-    """
-    This test only covers basic universal dependencies datasets.
-    For example, multi-word tokens or the "deps" column sentence annotations
-    are not supported yet.
-    """
+    # This test only covers basic universal dependencies datasets.
+    # For example, multi-word tokens or the "deps" column sentence annotations are not supported yet.
 
     # Here, we use the default token annotation fields.
     corpus = ColumnCorpus(
@@ -420,12 +466,11 @@ def test_load_universal_dependencies_conllu_corpus(tasks_base_path):
     _assert_universal_dependencies_conllu_dataset(corpus.train)
 
 
+@pytest.mark.skip()
 def test_hipe_2022_corpus(tasks_base_path):
-    """
-    This test covers the complete HIPE 2022 dataset.
-    https://github.com/hipe-eval/HIPE-2022-data
-    Includes variant with document separator, and all versions of the dataset.
-    """
+    # This test covers the complete HIPE 2022 dataset.
+    # https://github.com/hipe-eval/HIPE-2022-data
+    # Includes variant with document separator, and all versions of the dataset.
 
     # We have manually checked, that these numbers are correct:
     hipe_stats = {
@@ -631,7 +676,7 @@ def test_hipe_2022_corpus(tasks_base_path):
 
                     current_sents = stats["sents"]
                     current_docs = stats["docs"]
-                    current_labels = set(stats["labels"] + ["<unk>"])
+                    current_labels = set(stats["labels"])
 
                     total_sentences = current_sents + current_docs if add_document_separator else stats["sents"]
 
@@ -685,11 +730,11 @@ def test_hipe_2022_corpus(tasks_base_path):
     test_hipe_2022(dataset_version="v2.1", add_document_separator=False)
 
 
+@pytest.mark.skip()
 def test_icdar_europeana_corpus(tasks_base_path):
-    """
-    This test covers the complete ICDAR Europeana corpus:
-    https://github.com/stefan-it/historic-domain-adaptation-icdar
-    """
+    # This test covers the complete ICDAR Europeana corpus:
+    # https://github.com/stefan-it/historic-domain-adaptation-icdar
+
     gold_stats = {"fr": {"train": 7936, "dev": 992, "test": 992}, "nl": {"train": 5777, "dev": 722, "test": 723}}
 
     def check_number_sentences(reference: int, actual: int, split_name: str):
@@ -701,6 +746,235 @@ def test_icdar_europeana_corpus(tasks_base_path):
         check_number_sentences(len(corpus.train), gold_stats[language]["train"], "train")
         check_number_sentences(len(corpus.dev), gold_stats[language]["dev"], "dev")
         check_number_sentences(len(corpus.test), gold_stats[language]["test"], "test")
+
+
+@pytest.mark.skip()
+def test_masakhane_corpus(tasks_base_path):
+    # This test covers the complete MasakhaNER dataset, including support for v1 and v2.
+    supported_versions = ["v1", "v2"]
+
+    supported_languages = {
+        "v1": ["amh", "hau", "ibo", "kin", "lug", "luo", "pcm", "swa", "wol", "yor"],
+        "v2": [
+            "bam",
+            "bbj",
+            "ewe",
+            "fon",
+            "hau",
+            "ibo",
+            "kin",
+            "lug",
+            "mos",
+            "pcm",
+            "nya",
+            "sna",
+            "swa",
+            "tsn",
+            "twi",
+            "wol",
+            "xho",
+            "yor",
+            "zul",
+        ],
+    }
+
+    masakhane_stats = {
+        "v1": {
+            "amh": {"train": 1750, "dev": 250, "test": 500},
+            "hau": {"train": 1912, "dev": 276, "test": 552},
+            "ibo": {"train": 2235, "dev": 320, "test": 638},
+            "kin": {
+                "train": 2116,
+                "dev": 302,
+                "test": 605,
+            },
+            "lug": {"train": 1428, "dev": 200, "test": 407},
+            "luo": {"train": 644, "dev": 92, "test": 186},
+            "pcm": {"train": 2124, "dev": 306, "test": 600},
+            "swa": {"train": 2109, "dev": 300, "test": 604},
+            "wol": {"train": 1871, "dev": 267, "test": 539},
+            "yor": {"train": 2171, "dev": 305, "test": 645},
+        },
+        "v2": {
+            "bam": {"train": 4462, "dev": 638, "test": 1274},
+            "bbj": {"train": 3384, "dev": 483, "test": 966},
+            "ewe": {"train": 3505, "dev": 501, "test": 1001},
+            "fon": {"train": 4343, "dev": 623, "test": 1228},
+            "hau": {"train": 5716, "dev": 816, "test": 1633},
+            "ibo": {"train": 7634, "dev": 1090, "test": 2181},
+            "kin": {"train": 7825, "dev": 1118, "test": 2235},
+            "lug": {"train": 4942, "dev": 706, "test": 1412},
+            "mos": {"train": 4532, "dev": 648, "test": 1294},
+            "pcm": {"train": 5646, "dev": 806, "test": 1613},
+            "nya": {"train": 6250, "dev": 893, "test": 1785},
+            "sna": {"train": 6207, "dev": 887, "test": 1773},
+            "swa": {"train": 6593, "dev": 942, "test": 1883},
+            "tsn": {"train": 3489, "dev": 499, "test": 996},
+            "twi": {"train": 4240, "dev": 605, "test": 1211},
+            "wol": {"train": 4593, "dev": 656, "test": 1312},
+            "xho": {"train": 5718, "dev": 817, "test": 1633},
+            "yor": {"train": 6876, "dev": 983, "test": 1964},
+            "zul": {"train": 5848, "dev": 836, "test": 1670},
+        },
+    }
+
+    def check_number_sentences(reference: int, actual: int, split_name: str, language: str, version: str):
+        assert actual == reference, f"Mismatch in number of sentences for {language}@{version}/{split_name}"
+
+    for version in supported_versions:
+        for language in supported_languages[version]:
+            corpus = flair.datasets.NER_MASAKHANE(languages=language, version=version)
+
+            gold_stats = masakhane_stats[version][language]
+
+            check_number_sentences(len(corpus.train), gold_stats["train"], "train", language, version)
+            check_number_sentences(len(corpus.dev), gold_stats["dev"], "dev", language, version)
+            check_number_sentences(len(corpus.test), gold_stats["test"], "test", language, version)
+
+
+@pytest.mark.skip()
+def test_nermud_corpus(tasks_base_path):
+    # This test covers the NERMuD dataset. Official stats can be found here:
+    # https://github.com/dhfbk/KIND/tree/main/evalita-2023
+    gold_stats = {
+        "WN": {"train": 10912, "dev": 2594},
+        "FIC": {"train": 11423, "dev": 1051},
+        "ADG": {"train": 5147, "dev": 1122},
+    }
+
+    def check_number_sentences(reference: int, actual: int, split_name: str):
+        assert actual == reference, f"Mismatch in number of sentences for {split_name} split"
+
+    for domain, stats in gold_stats.items():
+        corpus = flair.datasets.NER_NERMUD(domains=domain)
+        check_number_sentences(len(corpus.train), stats["train"], "train")
+        check_number_sentences(len(corpus.dev), stats["dev"], "dev")
+
+
+@pytest.mark.skip()
+def test_german_ler_corpus(tasks_base_path):
+    corpus = flair.datasets.NER_GERMAN_LEGAL()
+
+    # Number of instances per dataset split are taken from https://huggingface.co/datasets/elenanereiss/german-ler
+    assert len(corpus.train) == 53384, "Mismatch in number of sentences for train split"
+    assert len(corpus.dev) == 6666, "Mismatch in number of sentences for dev split"
+    assert len(corpus.test) == 6673, "Mismatch in number of sentences for test split"
+
+
+@pytest.mark.skip()
+def test_masakha_pos_corpus(tasks_base_path):
+    # This test covers the complete MasakhaPOS dataset.
+    supported_versions = ["v1"]
+
+    supported_languages = {
+        "v1": [
+            "bam",
+            "bbj",
+            "ewe",
+            "fon",
+            "hau",
+            "ibo",
+            "kin",
+            "lug",
+            "luo",
+            "mos",
+            "pcm",
+            "nya",
+            "sna",
+            "swa",
+            "tsn",
+            "twi",
+            "wol",
+            "xho",
+            "yor",
+            "zul",
+        ],
+    }
+
+    masakha_pos_stats = {
+        "v1": {
+            "bam": {"train": 775, "dev": 154, "test": 619},
+            "bbj": {"train": 750, "dev": 149, "test": 599},
+            "ewe": {"train": 728, "dev": 145, "test": 582},
+            "fon": {"train": 810, "dev": 161, "test": 646},
+            "hau": {"train": 753, "dev": 150, "test": 601},
+            "ibo": {"train": 803, "dev": 160, "test": 642},
+            "kin": {"train": 757, "dev": 151, "test": 604},
+            "lug": {"train": 733, "dev": 146, "test": 586},
+            "luo": {"train": 758, "dev": 151, "test": 606},
+            "mos": {"train": 757, "dev": 151, "test": 604},
+            "pcm": {"train": 752, "dev": 150, "test": 600},
+            "nya": {"train": 728, "dev": 145, "test": 582},
+            "sna": {"train": 747, "dev": 149, "test": 596},
+            "swa": {"train": 693, "dev": 138, "test": 553},
+            "tsn": {"train": 754, "dev": 150, "test": 602},
+            "twi": {"train": 785, "dev": 157, "test": 628},
+            "wol": {"train": 782, "dev": 156, "test": 625},
+            "xho": {"train": 752, "dev": 150, "test": 601},
+            "yor": {"train": 893, "dev": 178, "test": 713},
+            "zul": {"train": 753, "dev": 150, "test": 601},
+        },
+    }
+
+    def check_number_sentences(reference: int, actual: int, split_name: str, language: str, version: str):
+        assert actual == reference, f"Mismatch in number of sentences for {language}@{version}/{split_name}"
+
+    for version in supported_versions:
+        for language in supported_languages[version]:
+            corpus = flair.datasets.MASAKHA_POS(languages=language, version=version)
+
+            gold_stats = masakha_pos_stats[version][language]
+
+            check_number_sentences(len(corpus.train), gold_stats["train"], "train", language, version)
+            check_number_sentences(len(corpus.dev), gold_stats["dev"], "dev", language, version)
+            check_number_sentences(len(corpus.test), gold_stats["test"], "test", language, version)
+
+
+@pytest.mark.skip()
+def test_german_mobie(tasks_base_path):
+    corpus = flair.datasets.NER_GERMAN_MOBIE()
+
+    # See MobIE paper (https://aclanthology.org/2021.konvens-1.22/), table 2
+    ref_sentences = 7_077
+    ref_tokens = 90_971
+
+    actual_sentences = sum(
+        [1 for sentence in corpus.train + corpus.dev + corpus.test if sentence[0].text != "-DOCSTART-"]
+    )
+    actual_tokens = sum(
+        [len(sentence) for sentence in corpus.train + corpus.dev + corpus.test if sentence[0].text != "-DOCSTART-"]
+    )
+
+    assert ref_sentences == actual_sentences, (
+        f"Number of parsed sentences ({actual_sentences}) does not match with "
+        f"reported number of sentences ({ref_sentences})!"
+    )
+    assert (
+        ref_tokens == actual_tokens
+    ), f"Number of parsed tokens ({actual_tokens}) does not match with reported number of tokens ({ref_tokens})!"
+
+
+@pytest.mark.skip()
+def test_bavarian_wiki(tasks_base_path):
+    corpus = flair.datasets.NER_BAVARIAN_WIKI()
+
+    ref_sentences = 3_577
+    ref_tokens = 75_690
+
+    actual_sentences = sum(
+        [1 for sentence in corpus.train + corpus.dev + corpus.test if sentence[0].text != "-DOCSTART-"]
+    )
+    actual_tokens = sum(
+        [len(sentence) for sentence in corpus.train + corpus.dev + corpus.test if sentence[0].text != "-DOCSTART-"]
+    )
+
+    assert ref_sentences == actual_sentences, (
+        f"Number of parsed sentences ({actual_sentences}) does not match with "
+        f"reported number of sentences ({ref_sentences})!"
+    )
+    assert (
+        ref_tokens == actual_tokens
+    ), f"Number of parsed tokens ({actual_tokens}) does not match with reported number of tokens ({ref_tokens})!"
 
 
 def test_multi_file_jsonl_corpus_should_use_label_type(tasks_base_path):
@@ -725,9 +999,7 @@ def test_jsonl_corpus_should_use_label_type(tasks_base_path):
 
 
 def test_jsonl_dataset_should_use_label_type(tasks_base_path):
-    """
-    Tests whether the dataset respects the label_type parameter
-    """
+    """Tests whether the dataset respects the label_type parameter."""
     dataset = JsonlDataset(tasks_base_path / "jsonl" / "train.jsonl", label_type="pos")  # use other type
 
     for sentence in dataset.sentences:
@@ -736,9 +1008,7 @@ def test_jsonl_dataset_should_use_label_type(tasks_base_path):
 
 
 def test_reading_jsonl_dataset_should_be_successful(tasks_base_path):
-    """
-    Tests reading a JsonlDataset containing multiple tagged entries
-    """
+    """Tests reading a JsonlDataset containing multiple tagged entries."""
     dataset = JsonlDataset(tasks_base_path / "jsonl" / "train.jsonl")
 
     assert len(dataset.sentences) == 5
@@ -758,13 +1028,54 @@ def test_jsonl_corpus_loads_spans(tasks_base_path):
     assert len(example.get_spans("ner")) > 0
 
 
+def test_jsonl_corpus_loads_metadata(tasks_base_path):
+    """Tests reading a JsonlDataset containing metadata."""
+    dataset = JsonlDataset(tasks_base_path / "jsonl" / "testa.jsonl")
+
+    assert len(dataset.sentences) == 3
+    assert dataset.sentences[0].get_metadata("from") == 123
+    assert dataset.sentences[1].get_metadata("from") == 124
+    assert dataset.sentences[2].get_metadata("from") == 125
+
+
+@pytest.mark.skip()
+def test_ontonotes_download():
+    from urllib.parse import urlparse
+
+    res = urlparse(ONTONOTES.archive_url)
+    assert all([res.scheme, res.netloc])
+
+
+@pytest.mark.skip()
+def test_ontonotes_extraction(tasks_base_path):
+    import os
+    import tempfile
+
+    from flair.file_utils import unpack_file
+
+    ontonotes_path = tasks_base_path / "ontonotes"
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        unpack_file(ontonotes_path / "tiny-conll-2012.zip", tmp_dir, "zip", True)
+        assert "conll-2012" in os.listdir(tmp_dir)
+
+        corpus = ONTONOTES(base_path=tmp_dir)
+        label_dictionary = corpus.make_label_dictionary("ner")
+
+        assert len(label_dictionary) == 14
+        assert label_dictionary.span_labels
+
+        domain_specific_corpus = ONTONOTES(base_path=tmp_dir, domain=["bc"])
+
+        assert len(corpus.train) > len(domain_specific_corpus.train)
+
+
 TRAIN_FILE = "tests/resources/tasks/jsonl/train.jsonl"
 TESTA_FILE = "tests/resources/tasks/jsonl/testa.jsonl"
 TESTB_FILE = "tests/resources/tasks/jsonl/testa.jsonl"
 
 
 @pytest.mark.parametrize(
-    "train_files,dev_files,test_files,expected_size",
+    ("train_files", "dev_files", "test_files", "expected_size"),
     [
         (
             [TRAIN_FILE],

@@ -1,5 +1,5 @@
 import logging
-from typing import List
+from typing import Any, Optional
 
 import torch
 import torch.nn.functional as F
@@ -19,7 +19,7 @@ from torch.nn import (
 
 import flair
 from flair.data import Image
-from flair.embeddings.base import Embeddings
+from flair.embeddings.base import Embeddings, register_embeddings
 
 log = logging.getLogger("flair")
 
@@ -29,19 +29,31 @@ class ImageEmbeddings(Embeddings[Image]):
     def embedding_type(self) -> str:
         return "image-level"
 
+    def to_params(self) -> dict[str, Any]:
+        # legacy pickle-like saving for image embeddings, as implementation details are not obvious
+        return self.__getstate__()
 
+    @classmethod
+    def from_params(cls, params: dict[str, Any]) -> "Embeddings":
+        # legacy pickle-like loading for image embeddings, as implementation details are not obvious
+        embedding = cls.__new__(cls)
+        embedding.__setstate__(params)
+        return embedding
+
+
+@register_embeddings
 class IdentityImageEmbeddings(ImageEmbeddings):
-    def __init__(self, transforms):
+    def __init__(self, transforms) -> None:
         import PIL as pythonimagelib
 
         self.PIL = pythonimagelib
         self.name = "Identity"
         self.transforms = transforms
-        self.__embedding_length = None
+        self.__embedding_length: Optional[int] = None
         self.static_embeddings = True
         super().__init__()
 
-    def _add_embeddings_internal(self, images: List[Image]):
+    def _add_embeddings_internal(self, images: list[Image]):
         for image in images:
             image_data = self.PIL.Image.open(image.imageURL)
             image_data.load()
@@ -49,21 +61,23 @@ class IdentityImageEmbeddings(ImageEmbeddings):
 
     @property
     def embedding_length(self) -> int:
+        assert self.__embedding_length is not None
         return self.__embedding_length
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.name
 
 
+@register_embeddings
 class PrecomputedImageEmbeddings(ImageEmbeddings):
-    def __init__(self, url2tensor_dict, name):
+    def __init__(self, url2tensor_dict, name) -> None:
         self.url2tensor_dict = url2tensor_dict
         self.name = name
-        self.__embedding_length = len(list(self.url2tensor_dict.values())[0])
+        self.__embedding_length = len(next(iter(self.url2tensor_dict.values())))
         self.static_embeddings = True
         super().__init__()
 
-    def _add_embeddings_internal(self, images: List[Image]):
+    def _add_embeddings_internal(self, images: list[Image]):
         for image in images:
             if image.imageURL in self.url2tensor_dict:
                 image.set_embedding(self.name, self.url2tensor_dict[image.imageURL])
@@ -74,22 +88,22 @@ class PrecomputedImageEmbeddings(ImageEmbeddings):
     def embedding_length(self) -> int:
         return self.__embedding_length
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.name
 
 
+@register_embeddings
 class NetworkImageEmbeddings(ImageEmbeddings):
-    def __init__(self, name, pretrained=True, transforms=None):
+    def __init__(self, name, pretrained=True, transforms=None) -> None:
         super().__init__()
 
         try:
-            import torchvision as torchvision
+            import torchvision
         except ModuleNotFoundError:
             log.warning("-" * 100)
             log.warning('ATTENTION! The library "torchvision" is not installed!')
             log.warning('To use convnets pretraned on ImageNet, please first install with "pip install torchvision"')
             log.warning("-" * 100)
-            pass
 
         model_info = {
             "resnet50": (torchvision.models.resnet50, lambda x: list(x)[:-1], 2048),
@@ -123,7 +137,7 @@ class NetworkImageEmbeddings(ImageEmbeddings):
         else:
             raise Exception(f"Image embeddings {name} not available.")
 
-    def _add_embeddings_internal(self, images: List[Image]):
+    def _add_embeddings_internal(self, images: list[Image]):
         image_tensor = torch.stack([self.transforms(image.data) for image in images])
         image_embeddings = self.features(image_tensor)
         image_embeddings = (
@@ -138,17 +152,18 @@ class NetworkImageEmbeddings(ImageEmbeddings):
     def embedding_length(self) -> int:
         return self.__embedding_length
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.name
 
 
+@register_embeddings
 class ConvTransformNetworkImageEmbeddings(ImageEmbeddings):
-    def __init__(self, feats_in, convnet_parms, posnet_parms, transformer_parms):
-        super(ConvTransformNetworkImageEmbeddings, self).__init__()
+    def __init__(self, feats_in, convnet_parms, posnet_parms, transformer_parms) -> None:
+        super().__init__()
 
         adaptive_pool_func_map = {"max": AdaptiveMaxPool2d, "avg": AdaptiveAvgPool2d}
 
-        convnet_arch = [] if convnet_parms["dropout"][0] <= 0 else [Dropout2d(convnet_parms["dropout"][0])]
+        convnet_arch: list[Any] = [] if convnet_parms["dropout"][0] <= 0 else [Dropout2d(convnet_parms["dropout"][0])]
         convnet_arch.extend(
             [
                 Conv2d(
@@ -251,7 +266,7 @@ class ConvTransformNetworkImageEmbeddings(ImageEmbeddings):
 
         return x
 
-    def _add_embeddings_internal(self, images: List[Image]):
+    def _add_embeddings_internal(self, images: list[Image]):
         image_tensor = torch.stack([image.data for image in images])
         image_embeddings = self.forward(image_tensor)
         for image_id, image in enumerate(images):
@@ -261,5 +276,5 @@ class ConvTransformNetworkImageEmbeddings(ImageEmbeddings):
     def embedding_length(self):
         return self._feat_dim
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.name

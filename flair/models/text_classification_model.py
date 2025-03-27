@@ -1,21 +1,20 @@
 import logging
 from pathlib import Path
-from typing import List
+from typing import Any, Union
 
 import torch
 
 import flair.embeddings
 import flair.nn
 from flair.data import Sentence
-from flair.embeddings import Embeddings
 from flair.file_utils import cached_path
 
 log = logging.getLogger("flair")
 
 
 class TextClassifier(flair.nn.DefaultClassifier[Sentence, Sentence]):
-    """
-    Text Classification Model
+    """Text Classification Model.
+
     The model takes word embeddings, puts them into an RNN to obtain a text
     representation, and puts the text representation in the end into a linear
     layer to get the actual class label. The model can handle single and multi
@@ -24,45 +23,46 @@ class TextClassifier(flair.nn.DefaultClassifier[Sentence, Sentence]):
 
     def __init__(
         self,
-        document_embeddings: flair.embeddings.DocumentEmbeddings,
+        embeddings: flair.embeddings.DocumentEmbeddings,
         label_type: str,
         **classifierargs,
-    ):
-        """
-        Initializes a TextClassifier
-        :param document_embeddings: embeddings used to embed each data point
-        :param label_dictionary: dictionary of labels you want to predict
-        :param multi_label: auto-detected by default, but you can set this to True to force multi-label prediction
-        or False to force single-label prediction
-        :param multi_label_threshold: If multi-label you can set the threshold to make predictions
-        :param beta: Parameter for F-beta score for evaluation and training annealing
-        :param loss_weights: Dictionary of weights for labels for the loss function
-        (if any label's weight is unspecified it will default to 1.0)
-        """
+    ) -> None:
+        """Initializes a TextClassifier.
 
-        super(TextClassifier, self).__init__(
+        Args:
+            embeddings: embeddings used to embed each data point
+            label_dictionary: dictionary of labels you want to predict
+            label_type: string identifier for tag type
+            multi_label: auto-detected by default, but you can set this to True to force multi-label predictions
+                or False to force single-label predictions.
+            multi_label_threshold: If multi-label you can set the threshold to make predictions
+            beta: Parameter for F-beta score for evaluation and training annealing
+            loss_weights: Dictionary of weights for labels for the loss function. If any label's weight is
+                unspecified it will default to 1.0
+            **classifierargs: The arguments propagated to :meth:`flair.nn.DefaultClassifier.__init__`
+        """
+        super().__init__(
             **classifierargs,
-            final_embedding_size=document_embeddings.embedding_length,
+            embeddings=embeddings,
+            final_embedding_size=embeddings.embedding_length,
         )
-
-        self.document_embeddings: flair.embeddings.DocumentEmbeddings = document_embeddings
 
         self._label_type = label_type
 
         # auto-spawn on GPU if available
         self.to(flair.device)
 
-    def _embed_prediction_data_point(self, prediction_data_point: Sentence) -> torch.Tensor:
-        embedding_names = self.document_embeddings.get_names()
+    def _get_embedding_for_data_point(self, prediction_data_point: Sentence) -> torch.Tensor:
+        embedding_names = self.embeddings.get_names()
         return prediction_data_point.get_embedding(embedding_names)
 
-    def _get_prediction_data_points(self, sentences: List[Sentence]) -> List[Sentence]:
-        return sentences
+    def _get_data_points_from_sentence(self, sentence: Sentence) -> list[Sentence]:
+        return [sentence]
 
     def _get_state_dict(self):
         model_state = {
             **super()._get_state_dict(),
-            "document_embeddings": self.document_embeddings,
+            "document_embeddings": self.embeddings.save_embeddings(use_state_dict=False),
             "label_dictionary": self.label_dictionary,
             "label_type": self.label_type,
             "multi_label": self.multi_label,
@@ -71,16 +71,18 @@ class TextClassifier(flair.nn.DefaultClassifier[Sentence, Sentence]):
         }
         return model_state
 
-    @property
-    def _inner_embeddings(self) -> Embeddings[Sentence]:
-        return self.document_embeddings
-
     @classmethod
     def _init_model_with_state_dict(cls, state, **kwargs):
+        import re
+
+        # remap state dict for models serialized with Flair <= 0.11.3
+        state_dict = state["state_dict"]
+        for key in list(state_dict.keys()):
+            state_dict[re.sub("^document_embeddings\\.", "embeddings.", key)] = state_dict.pop(key)
 
         return super()._init_model_with_state_dict(
             state,
-            document_embeddings=state.get("document_embeddings"),
+            embeddings=state.get("document_embeddings"),
             label_dictionary=state.get("label_dictionary"),
             label_type=state.get("label_type"),
             multi_label=state.get("multi_label"),
@@ -90,8 +92,7 @@ class TextClassifier(flair.nn.DefaultClassifier[Sentence, Sentence]):
         )
 
     @staticmethod
-    def _fetch_model(model_name) -> str:
-
+    def _fetch_model(model_identifier) -> str:
         model_map = {}
         hu_path: str = "https://nlp.informatik.hu-berlin.de/resources/models"
 
@@ -122,11 +123,17 @@ class TextClassifier(flair.nn.DefaultClassifier[Sentence, Sentence]):
         model_map["communicative-functions"] = "/".join([hu_path, "comfunc", "communicative-functions.pt"])
 
         cache_dir = Path("models")
-        if model_name in model_map:
-            model_name = cached_path(model_map[model_name], cache_dir=cache_dir)
+        if model_identifier in model_map:
+            model_identifier = cached_path(model_map[model_identifier], cache_dir=cache_dir)
 
-        return model_name
+        return model_identifier
 
     @property
     def label_type(self):
         return self._label_type
+
+    @classmethod
+    def load(cls, model_path: Union[str, Path, dict[str, Any]]) -> "TextClassifier":
+        from typing import cast
+
+        return cast("TextClassifier", super().load(model_path=model_path))
