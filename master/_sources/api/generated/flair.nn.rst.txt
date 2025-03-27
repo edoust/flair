@@ -1,0 +1,19 @@
+﻿flair.nn
+========
+
+.. automodule:: flair.nn
+
+   
+   .. rubric:: Classes
+
+   .. autosummary::
+   
+      Classifier
+      DeepNCMDecoder
+      DefaultClassifier
+      LabelVerbalizerDecoder
+      LockedDropout
+      Model
+      PrototypicalDecoder
+      WordDropout
+   

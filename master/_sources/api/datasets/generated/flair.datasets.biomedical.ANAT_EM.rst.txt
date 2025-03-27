@@ -1,0 +1,40 @@
+﻿flair.datasets.biomedical.ANAT\_EM
+==================================
+
+.. currentmodule:: flair.datasets.biomedical
+
+.. autoclass:: ANAT_EM
+
+   
+   .. automethod:: __init__
+
+   
+   .. rubric:: Methods
+
+   .. autosummary::
+   
+      ~ANAT_EM.__init__
+      ~ANAT_EM.add_label_noise
+      ~ANAT_EM.downsample
+      ~ANAT_EM.filter_empty_sentences
+      ~ANAT_EM.filter_long_sentences
+      ~ANAT_EM.get_all_sentences
+      ~ANAT_EM.get_label_distribution
+      ~ANAT_EM.make_label_dictionary
+      ~ANAT_EM.make_tag_dictionary
+      ~ANAT_EM.make_vocab_dictionary
+      ~ANAT_EM.obtain_statistics
+   
+   
+
+   
+   
+   .. rubric:: Attributes
+
+   .. autosummary::
+   
+      ~ANAT_EM.dev
+      ~ANAT_EM.test
+      ~ANAT_EM.train
+   
+   

@@ -1,0 +1,31 @@
+﻿flair.models
+============
+
+.. automodule:: flair.models
+
+   
+   .. rubric:: Classes
+
+   .. autosummary::
+   
+      EntityMentionLinker
+      FewshotClassifier
+      LanguageModel
+      Lemmatizer
+      MultitaskModel
+      PrefixedSequenceTagger
+      RegexpTagger
+      RelationClassifier
+      RelationExtractor
+      SequenceTagger
+      SpanClassifier
+      TARSClassifier
+      TARSTagger
+      TextClassifier
+      TextPairClassifier
+      TextPairRegressor
+      TextRegressor
+      TextTripleClassifier
+      TokenClassifier
+      WordTagger
+   
